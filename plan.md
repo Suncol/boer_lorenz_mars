@@ -152,8 +152,8 @@ radius, Omega, g, Rd, cp, kappa, p0
 原始 Mars GCM / reanalysis 数据
   -> 统一读入与时间对齐
   -> remap 到 pressure levels
-  -> 依据 ps 构造 Theta = H(ps - p)
-  -> mask below-ground cells
+  -> 依据 ps 构造 Theta = 1 if p < ps, else 0
+  -> mask p >= ps 的非大气侧单元（surface boundary + below-ground）
   -> 公共数学层
      -> Boer 支路: reservoirs / conversions / closure
      -> SEBA 支路: hke / rke / dke / ape / flux diagnostics
@@ -260,9 +260,13 @@ I_M_zm(Y) = sum_{j,k} Y_jk * (2 pi a^2 cos(phi_j) Delta_phi_j) * Delta_p_k / g
 定义地形指示函数：
 
 ```text
-Theta(lambda, phi, p, t) = 1  if p <= ps
-                           0  if p > ps
+Theta(lambda, phi, p, t) = 1  if p < ps
+                           0  if p >= ps
 ```
+
+这里采用严格体积内点约定：`p = ps` 视为地表下边界，不属于大气体积积分域；
+所有 `Theta`-weighted volume terms 只统计 `p < ps` 的 pressure levels。与地表边界
+相关的贡献应进入相应的 surface terms，而不是混入 `Theta` 体积项。
 
 定义代表性纬圈平均与扰动：
 
@@ -432,10 +436,15 @@ dK_Z/dt = C_Z - C_K - F_Z_pos
 在进入 SEBA 之前必须先依据 surface pressure 构造：
 
 ```text
-Theta = H(ps - p)
+Theta =
+  1, if p < ps
+  0, if p >= ps
 ```
 
-并将 `u, v, omega, T` 的 below-ground 单元做成 masked array。
+这里不使用未定义 `H(0)` 的 `H(ps - p)` 记法，以避免 `p = ps` 的歧义。
+`p = ps` 一律按地表边界处理，不进入 `Theta`-weighted volume terms。
+
+并将 `u, v, omega, T` 的 `p >= ps` 单元做成 masked array。
 
 ### 3. 火星常数适配策略
 
