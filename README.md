@@ -123,3 +123,47 @@ dataset_fluxes.visualize_sections(
 ```
 
 Plots **vertical cross-sections** of specific HKE budget terms (e.g., conversion from APE to HKE, vertical flux divergence) as a function of pressure and horizontal wavenumber.
+
+## Live SEBA validation
+
+The live Mars/SEBA cross-validation path in `tests/test_seba_validation.py` runs against an
+installed SEBA runtime, not just the repository source tree. This matters because
+`seba.seba` imports both the compiled `numeric_tools` extension and `shtns`.
+
+On macOS/Homebrew with the repository-managed uv environment:
+
+```bash
+source .venv/bin/activate
+brew install fftw pkg-config
+export PKG_CONFIG_PATH="$(brew --prefix fftw)/lib/pkgconfig:${PKG_CONFIG_PATH}"
+export CPPFLAGS="-I$(brew --prefix fftw)/include ${CPPFLAGS}"
+export LDFLAGS="-L$(brew --prefix fftw)/lib ${LDFLAGS}"
+uv pip install --no-binary shtns shtns
+export MESON="$PWD/.venv/bin/meson"
+export NINJA="$PWD/.venv/bin/ninja"
+uv pip install -e .
+```
+
+This project keeps `mars_exact_lec` source-imported during local test runs; the installed
+editable runtime is only required for `seba` itself. Pinning `MESON` and `NINJA` to
+`.venv/bin` keeps the editable loader from capturing temporary uv build-environment tool paths.
+
+If you prefer not to export those tool paths, the supported fallback is:
+
+```bash
+uv pip install --no-build-isolation -e .
+```
+
+If your toolchain cannot provide OpenMP-compatible flags and libraries, disable OpenMP for
+SEBA's own `numeric_tools` build and reinstall:
+
+```bash
+uv pip install --no-build-isolation -Csetup-args=-Dopenmp=false -e .
+```
+
+Once the environment is ready, run the live validation path with:
+
+```bash
+source .venv/bin/activate
+python -m pytest -m live_seba -rs tests/test_seba_validation.py
+```

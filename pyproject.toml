@@ -27,6 +27,12 @@ dependencies = [
     "xarray",
     "matplotlib",
     "pint",
+    "pandas",
+    "astropy",
+    "joblib",
+    "dask",
+    "pyproj",
+    "psutil",
     "shtns",
 ]
 
@@ -40,3 +46,7 @@ package-dir = {"" = "src"}
 [tool.meson-python.args]
 setup = ["--reconfigure"] # Reconfigure on build
 
+[tool.pytest.ini_options]
+markers = [
+    "live_seba: tests that require an installed SEBA runtime with shtns and numeric_tools",
+]

@@ -183,7 +183,15 @@ class SebaDataset(Dataset):
         return instance
 
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+        if len(args) == 1 and isinstance(args[0], Dataset) and not kwargs:
+            dataset = args[0]
+            super().__init__(
+                data_vars={name: dataset[name] for name in dataset.data_vars},
+                coords={name: dataset.coords[name] for name in dataset.coords},
+                attrs=dict(dataset.attrs),
+            )
+        else:
+            super().__init__(*args, **kwargs)
 
     def find_coordinate(self, coord_name=None, raise_notfound=True):
         # Use the instance variables to perform the necessary computations
