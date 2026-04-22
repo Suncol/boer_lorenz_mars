@@ -5,7 +5,14 @@ import pytest
 np = pytest.importorskip("numpy")
 xr = pytest.importorskip("xarray")
 
-from mars_exact_lec.common.integrals import build_mass_integrator, delta_p, integrate_mass_full, integrate_mass_zonal
+import mars_exact_lec.common.integrals as mass_integrals
+from mars_exact_lec.common.integrals import (
+    build_mass_integrator,
+    delta_p,
+    integrate_mass_full,
+    integrate_mass_zonal,
+    pressure_level_edges,
+)
 from mars_exact_lec.constants_mars import MARS
 
 from .helpers import full_field, make_coords, pressure_field, zonal_field
@@ -40,3 +47,22 @@ def test_full_and_zonal_mass_integrals_agree_for_zonally_symmetric_field():
     zonal_result = integrate_mass_zonal(zonal, integrator=integrator)
 
     np.testing.assert_allclose(full_result.values, zonal_result.values)
+
+
+def test_pressure_level_edges_and_delta_p_use_explicit_bounds_when_available(monkeypatch):
+    level = xr.DataArray(
+        np.asarray([820.0, 560.0, 240.0]),
+        dims=("level",),
+        coords={"level": [820.0, 560.0, 240.0]},
+        attrs={"units": "Pa", "axis": "Z", "standard_name": "pressure"},
+        name="level",
+    )
+    bounds = xr.DataArray(
+        np.asarray([[980.0, 700.0], [700.0, 420.0], [420.0, 60.0]]),
+        dims=("level", "bounds"),
+        coords={"level": level.values, "bounds": [0, 1]},
+    )
+    monkeypatch.setattr(mass_integrals, "_get_explicit_level_bounds", lambda _: bounds)
+
+    np.testing.assert_allclose(pressure_level_edges(level).values, np.asarray([980.0, 700.0, 420.0, 60.0]))
+    np.testing.assert_allclose(delta_p(level).values, np.asarray([280.0, 280.0, 360.0]))

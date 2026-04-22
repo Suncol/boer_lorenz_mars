@@ -9,7 +9,7 @@ import xarray as xr
 
 from .._validation import FIELD_DIMS, normalize_coordinate, normalize_field, require_dataarray
 from ..common.grid_weights import cell_area as build_cell_area
-from ..common.integrals import MassIntegrator
+from ..common.integrals import MassIntegrator, pressure_level_edges as _pressure_level_edges
 from ..constants_mars import MARS, MarsConstants
 
 SURFACE_DIMS = ("time", "latitude", "longitude")
@@ -18,21 +18,9 @@ ISENTROPIC_LAYER_DIM = "isentropic_layer"
 
 
 def pressure_level_edges(level: xr.DataArray) -> xr.DataArray:
-    """Return pressure interfaces for a strictly descending pressure coordinate."""
+    """Return pressure interfaces using the shared mass-integrator convention."""
 
-    level = normalize_coordinate(level, "level")
-    values = np.asarray(level.values, dtype=float)
-    edges = np.empty(values.size + 1, dtype=float)
-    edges[1:-1] = 0.5 * (values[:-1] + values[1:])
-    edges[0] = values[0] + 0.5 * (values[0] - values[1])
-    edges[-1] = max(0.0, values[-1] + 0.5 * (values[-1] - values[-2]))
-    return xr.DataArray(
-        edges,
-        dims=("level_edge",),
-        coords={"level_edge": np.arange(edges.size)},
-        name="pressure_level_edges",
-        attrs={"units": "Pa"},
-    )
+    return _pressure_level_edges(level)
 
 
 def normalize_isentropic_coordinate(
@@ -148,12 +136,23 @@ def interpolate_pressure_to_isentropes_metadata(
     *,
     repair_monotonic: bool = True,
 ) -> xr.Dataset:
-    """Return interpolated isentropic pressures together with column diagnostics."""
+    """Return interpolated isentropic pressures together with column diagnostics.
+
+    The returned metadata distinguishes pressure-level centers from pressure
+    interfaces:
+
+    - ``column_top_pressure`` / ``column_bottom_pressure`` describe the topmost
+      and bottommost resolved pressure-level centers used by the interpolation;
+    - ``column_top_edge_pressure`` / ``column_bottom_edge_pressure`` describe
+      the corresponding pressure-level interfaces and are the authoritative
+      bounds for phase-2 discrete mass statistics.
+    """
 
     theta = normalize_field(potential_temperature_field, "potential_temperature_field")
     pressure_field = _broadcast_pressure_field(theta, pressure)
     mask_field = _broadcast_mask_field(theta, theta_mask)
     targets = normalize_isentropic_coordinate(theta_levels, name=ISENTROPIC_DIM)
+    level_edges = pressure_level_edges(theta.coords["level"])
 
     (
         pressure_on_isentrope,
@@ -162,6 +161,8 @@ def interpolate_pressure_to_isentropes_metadata(
         theta_max,
         p_top,
         p_bottom,
+        p_top_edge,
+        p_bottom_edge,
         valid_count,
         monotonic_violations,
         monotonic_repairs,
@@ -171,8 +172,9 @@ def interpolate_pressure_to_isentropes_metadata(
         pressure_field,
         mask_field,
         targets,
+        level_edges,
         kwargs={"repair_monotonic": repair_monotonic},
-        input_core_dims=[["level"], ["level"], ["level"], [ISENTROPIC_DIM]],
+        input_core_dims=[["level"], ["level"], ["level"], [ISENTROPIC_DIM], ["level_edge"]],
         output_core_dims=[
             [ISENTROPIC_DIM],
             [ISENTROPIC_DIM],
@@ -183,10 +185,12 @@ def interpolate_pressure_to_isentropes_metadata(
             [],
             [],
             [],
+            [],
+            [],
         ],
         vectorize=True,
         dask="parallelized",
-        output_dtypes=[float, bool, float, float, float, float, np.int64, np.int64, np.int64],
+        output_dtypes=[float, bool, float, float, float, float, float, float, np.int64, np.int64, np.int64],
     )
 
     pressure_on_isentrope = pressure_on_isentrope.transpose(
@@ -202,6 +206,8 @@ def interpolate_pressure_to_isentropes_metadata(
             "column_theta_max": theta_max,
             "column_top_pressure": p_top,
             "column_bottom_pressure": p_bottom,
+            "column_top_edge_pressure": p_top_edge,
+            "column_bottom_edge_pressure": p_bottom_edge,
             "valid_level_count": valid_count,
             "monotonic_violations": monotonic_violations,
             "monotonic_repairs": monotonic_repairs,
@@ -221,8 +227,10 @@ def interpolate_pressure_to_isentropes_metadata(
     data["isentrope_in_range"].attrs["long_name"] = "target isentrope lies within resolved column theta range"
     data["column_theta_min"].attrs.update({"units": "K", "long_name": "minimum resolved potential temperature in column"})
     data["column_theta_max"].attrs.update({"units": "K", "long_name": "maximum resolved potential temperature in column"})
-    data["column_top_pressure"].attrs.update({"units": "Pa", "long_name": "top resolved pressure in column"})
-    data["column_bottom_pressure"].attrs.update({"units": "Pa", "long_name": "bottom resolved pressure in column"})
+    data["column_top_pressure"].attrs.update({"units": "Pa", "long_name": "top resolved pressure-level center used in the column"})
+    data["column_bottom_pressure"].attrs.update({"units": "Pa", "long_name": "bottom resolved pressure-level center used in the column"})
+    data["column_top_edge_pressure"].attrs.update({"units": "Pa", "long_name": "upper interface of the top resolved pressure level in the column"})
+    data["column_bottom_edge_pressure"].attrs.update({"units": "Pa", "long_name": "lower interface of the bottom resolved pressure level in the column"})
     data["valid_level_count"].attrs["long_name"] = "number of above-ground resolved pressure levels used for interpolation"
     data["monotonic_violations"].attrs["long_name"] = "count of negative theta steps before any monotonic repair"
     data["monotonic_repairs"].attrs["long_name"] = "count of theta values raised by the monotonic envelope"
@@ -241,7 +249,12 @@ def isentropic_layer_mass_statistics(
 
     ``interpolation`` must come from :func:`interpolate_pressure_to_isentropes_metadata`
     and its isentropic coordinate is interpreted as ordered layer interfaces.
+    Phase 2 always returns discrete whole-cell mass statistics consistent with
+    the shared ``Theta + delta_p`` convention. ``surface_pressure`` is accepted
+    for interface compatibility only and does not affect the main outputs.
     """
+
+    del surface_pressure
 
     interpolation = _normalize_interpolation_dataset(interpolation)
     interfaces = normalize_isentropic_coordinate(interpolation.coords[ISENTROPIC_DIM], name=ISENTROPIC_DIM)
@@ -249,12 +262,8 @@ def isentropic_layer_mass_statistics(
         raise ValueError("At least two isentropic interfaces are required for layer statistics.")
 
     cell_area = _resolve_cell_area(interpolation, integrator=integrator, area=area)
-    top_pressure = interpolation["column_top_pressure"]
-    resolved_bottom_pressure = interpolation["column_bottom_pressure"]
-    if surface_pressure is None:
-        bottom_pressure = resolved_bottom_pressure
-    else:
-        bottom_pressure = _normalize_surface_pressure(surface_pressure, interpolation)
+    top_pressure = interpolation["column_top_edge_pressure"]
+    bottom_pressure = interpolation["column_bottom_edge_pressure"]
 
     pressure_on_isentrope = interpolation["pressure_on_isentrope"]
     theta_min = interpolation["column_theta_min"]
@@ -270,7 +279,10 @@ def isentropic_layer_mass_statistics(
     interface_pressure = interface_pressure.transpose("time", ISENTROPIC_DIM, "latitude", "longitude")
     interface_pressure.name = "interface_pressure"
     interface_pressure.attrs.update(
-        {"units": "Pa", "long_name": "pressure at isentropic interfaces after conservative clipping"}
+        {
+            "units": "Pa",
+            "long_name": "pressure at isentropic interfaces after discrete whole-cell clipping",
+        }
     )
 
     lower = interface_pressure.isel({ISENTROPIC_DIM: slice(None, -1)}).rename({ISENTROPIC_DIM: ISENTROPIC_LAYER_DIM})
@@ -292,29 +304,29 @@ def isentropic_layer_mass_statistics(
 
     layer_mass_per_area = layer_pressure_thickness / constants.g
     layer_mass_per_area.name = "layer_mass_per_area"
-    layer_mass_per_area.attrs.update({"units": "kg m-2", "long_name": "mass per unit area of each isentropic layer"})
+    layer_mass_per_area.attrs.update({"units": "kg m-2", "long_name": "discrete whole-cell mass per unit area of each isentropic layer"})
 
     layer_mass = (layer_mass_per_area * cell_area).sum(dim=("latitude", "longitude"))
     layer_mass.name = "layer_mass"
-    layer_mass.attrs.update({"units": "kg", "long_name": "global mass of each isentropic layer"})
+    layer_mass.attrs.update({"units": "kg", "long_name": "global discrete whole-cell mass of each isentropic layer"})
 
     column_mass_per_area = ((bottom_pressure - top_pressure).clip(min=0.0) / constants.g).where(valid_columns)
     column_mass_per_area.name = "column_mass_per_area"
-    column_mass_per_area.attrs.update({"units": "kg m-2", "long_name": "resolved column mass per unit area"})
+    column_mass_per_area.attrs.update({"units": "kg m-2", "long_name": "resolved discrete whole-cell column mass per unit area"})
 
     column_mass = (column_mass_per_area * cell_area).sum(dim=("latitude", "longitude"))
     column_mass.name = "column_mass"
-    column_mass.attrs.update({"units": "kg", "long_name": "resolved total atmospheric mass"})
+    column_mass.attrs.update({"units": "kg", "long_name": "resolved total discrete whole-cell atmospheric mass"})
 
     cumulative_mass_above_per_area = ((interface_pressure - top_pressure).clip(min=0.0) / constants.g).where(valid_columns)
     cumulative_mass_above_per_area.name = "cumulative_mass_above_per_area"
     cumulative_mass_above_per_area.attrs.update(
-        {"units": "kg m-2", "long_name": "mass per unit area above each isentropic interface"}
+        {"units": "kg m-2", "long_name": "discrete whole-cell mass per unit area above each isentropic interface"}
     )
 
     cumulative_mass_above = (cumulative_mass_above_per_area * cell_area).sum(dim=("latitude", "longitude"))
     cumulative_mass_above.name = "cumulative_mass_above"
-    cumulative_mass_above.attrs.update({"units": "kg", "long_name": "global mass above each isentropic interface"})
+    cumulative_mass_above.attrs.update({"units": "kg", "long_name": "global discrete whole-cell mass above each isentropic interface"})
 
     result = xr.Dataset(
         data_vars={
@@ -334,9 +346,22 @@ def isentropic_layer_mass_statistics(
             "latitude": interpolation.coords["latitude"],
             "longitude": interpolation.coords["longitude"],
         },
-        attrs={"clipping": "surface-and-top-limited", "extrapolation": "disabled"},
+        attrs={
+            "clipping": "level-edge-limited",
+            "extrapolation": "disabled",
+            "mass_mode": "discrete_whole_cell_phase2",
+            "surface_pressure_behavior": "ignored_for_main_outputs",
+        },
     )
     result = xr.merge([interpolation, result], compat="override")
+    result.attrs.update(
+        {
+            "clipping": "level-edge-limited",
+            "extrapolation": "disabled",
+            "mass_mode": "discrete_whole_cell_phase2",
+            "surface_pressure_behavior": "ignored_for_main_outputs",
+        }
+    )
     result = result.assign_coords(
         {
             "lower_isentrope": xr.DataArray(
@@ -443,6 +468,8 @@ def _normalize_interpolation_dataset(interpolation: xr.Dataset) -> xr.Dataset:
         "column_theta_max",
         "column_top_pressure",
         "column_bottom_pressure",
+        "column_top_edge_pressure",
+        "column_bottom_edge_pressure",
         "valid_level_count",
     }
     missing = required_vars.difference(interpolation.data_vars)
@@ -478,9 +505,10 @@ def _interpolate_column_to_isentropes(
     pressure_column: np.ndarray,
     mask_column: np.ndarray,
     targets: np.ndarray,
+    level_edges: np.ndarray,
     *,
     repair_monotonic: bool,
-) -> tuple[np.ndarray, np.ndarray, float, float, float, float, int, int, int]:
+) -> tuple[np.ndarray, np.ndarray, float, float, float, float, float, float, int, int, int]:
     valid = (
         np.isfinite(theta_column)
         & np.isfinite(pressure_column)
@@ -492,10 +520,11 @@ def _interpolate_column_to_isentropes(
     in_range = np.zeros(n_targets, dtype=bool)
 
     if not np.any(valid):
-        return pressure_out, in_range, np.nan, np.nan, np.nan, np.nan, 0, 0, 0
+        return pressure_out, in_range, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, 0, 0, 0
 
     theta_valid = np.asarray(theta_column[valid], dtype=float)
     pressure_valid = np.asarray(pressure_column[valid], dtype=float)
+    valid_indices = np.flatnonzero(valid)
     valid_count = int(theta_valid.size)
 
     theta_steps = np.diff(theta_valid)
@@ -511,6 +540,8 @@ def _interpolate_column_to_isentropes(
                 np.nan,
                 float(pressure_valid[-1]),
                 float(pressure_valid[0]),
+                float(level_edges[valid_indices[-1] + 1]),
+                float(level_edges[valid_indices[0]]),
                 valid_count,
                 monotonic_violations,
                 0,
@@ -525,6 +556,8 @@ def _interpolate_column_to_isentropes(
     theta_max = float(unique_theta[-1])
     p_bottom = float(pressure_valid[0])
     p_top = float(pressure_valid[-1])
+    p_bottom_edge = float(level_edges[valid_indices[0]])
+    p_top_edge = float(level_edges[valid_indices[-1] + 1])
 
     if unique_theta.size == 1:
         matches = np.isclose(targets, unique_theta[0], rtol=1e-10, atol=1e-12)
@@ -537,6 +570,8 @@ def _interpolate_column_to_isentropes(
             theta_max,
             p_top,
             p_bottom,
+            p_top_edge,
+            p_bottom_edge,
             valid_count,
             monotonic_violations,
             monotonic_repairs,
@@ -554,6 +589,8 @@ def _interpolate_column_to_isentropes(
         theta_max,
         p_top,
         p_bottom,
+        p_top_edge,
+        p_bottom_edge,
         valid_count,
         monotonic_violations,
         monotonic_repairs,

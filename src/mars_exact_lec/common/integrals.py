@@ -37,23 +37,50 @@ def _get_explicit_level_bounds(level: xr.DataArray) -> xr.DataArray | None:
     return None
 
 
-def delta_p(level: xr.DataArray) -> xr.DataArray:
-    """Return positive pressure thicknesses for descending pressure levels."""
+def pressure_level_edges(level: xr.DataArray) -> xr.DataArray:
+    """Return strictly descending pressure interfaces for a pressure coordinate."""
 
     level = normalize_coordinate(level, "level")
     bounds = _get_explicit_level_bounds(level)
     if bounds is not None:
         values = np.asarray(bounds.values, dtype=float)
-        thickness = np.abs(values[:, 0] - values[:, 1])
+        upper = np.maximum(values[:, 0], values[:, 1])
+        lower = np.minimum(values[:, 0], values[:, 1])
+        if values.shape[0] > 1 and not np.allclose(lower[:-1], upper[1:]):
+            raise ValueError("Pressure level bounds must define contiguous interfaces.")
+
+        edges = np.empty(values.shape[0] + 1, dtype=float)
+        edges[0] = upper[0]
+        edges[1:] = lower
     else:
         values = np.asarray(level.values, dtype=float)
         edges = np.empty(values.size + 1, dtype=float)
         edges[1:-1] = 0.5 * (values[:-1] + values[1:])
         edges[0] = values[0] + 0.5 * (values[0] - values[1])
         edges[-1] = max(0.0, values[-1] + 0.5 * (values[-1] - values[-2]))
-        thickness = edges[:-1] - edges[1:]
-        if np.any(thickness <= 0.0):
-            raise ValueError("Derived pressure thickness must be strictly positive.")
+
+    if np.any(edges <= 0.0):
+        raise ValueError("Derived pressure interfaces must remain strictly positive.")
+    if not np.all(np.diff(edges) < 0.0):
+        raise ValueError("Derived pressure interfaces must be strictly descending.")
+
+    return xr.DataArray(
+        edges,
+        dims=("level_edge",),
+        coords={"level_edge": np.arange(edges.size)},
+        name="pressure_level_edges",
+        attrs={"units": "Pa"},
+    )
+
+
+def delta_p(level: xr.DataArray) -> xr.DataArray:
+    """Return positive pressure thicknesses for descending pressure levels."""
+
+    level = normalize_coordinate(level, "level")
+    edges = pressure_level_edges(level)
+    thickness = np.asarray(edges.values[:-1] - edges.values[1:], dtype=float)
+    if np.any(thickness <= 0.0):
+        raise ValueError("Derived pressure thickness must be strictly positive.")
 
     return xr.DataArray(
         thickness,
@@ -191,6 +218,7 @@ def _default_global_longitude() -> xr.DataArray:
 
 
 __all__ = [
+    "pressure_level_edges",
     "delta_p",
     "MassIntegrator",
     "build_mass_integrator",
