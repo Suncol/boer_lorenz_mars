@@ -27,6 +27,11 @@ _NUMERIC_TIME_UNIT_SCALE = {
     "sols": _MARS_SOL_SECONDS,
 }
 
+_DERIVATIVE_UNIT_MAP = {
+    "J": "W",
+    "J m-2": "W m-2",
+}
+
 
 def _validate_coordinate_samples(coordinate: np.ndarray, dim: str) -> np.ndarray:
     values = np.asarray(coordinate, dtype=float)
@@ -161,6 +166,11 @@ def coordinate_derivative(
     derivative = derivative.transpose(*field.dims)
     derivative.name = name if name is not None else (f"d{field.name}_d{dim}" if field.name else f"dfield_d{dim}")
     derivative.attrs = dict(field.attrs)
+    input_units = derivative.attrs.get("units")
+    if isinstance(input_units, str):
+        mapped_units = _DERIVATIVE_UNIT_MAP.get(input_units.strip())
+        if mapped_units is not None:
+            derivative.attrs["units"] = mapped_units
     if derivative_units is not None:
         derivative.attrs["derivative_units"] = derivative_units
     derivative.attrs["derivative_dimension"] = dim

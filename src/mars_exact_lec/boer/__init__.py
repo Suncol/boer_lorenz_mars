@@ -1,5 +1,6 @@
 """Exact Boer reservoir and conversion terms available through stage 3."""
 
+from .closure import four_box_residual_generation_dissipation, four_box_storage_tendencies
 from .conversions import (
     C_A,
     C_E,
@@ -45,6 +46,8 @@ from .reservoirs import (
 )
 
 __all__ = [
+    "four_box_storage_tendencies",
+    "four_box_residual_generation_dissipation",
     "total_horizontal_ke",
     "kinetic_energy_zonal",
     "kinetic_energy_eddy",

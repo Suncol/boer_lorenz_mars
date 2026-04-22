@@ -10,8 +10,18 @@ from .integrals import (
     integrate_mass_zonal,
     integrate_surface,
 )
+from .normalization import normalize_dataset_per_area, planetary_area, to_per_area
 from .time_derivatives import time_derivative
-from .zonal_ops import representative_eddy, representative_zonal_mean, theta_coverage, zonal_mean
+from .topography_measure import TopographyAwareMeasure
+from .zonal_ops import (
+    representative_eddy,
+    representative_zonal_mean,
+    theta_coverage,
+    weighted_coverage,
+    weighted_representative_eddy,
+    weighted_representative_zonal_mean,
+    zonal_mean,
+)
 
 __all__ = [
     "infer_grid",
@@ -23,12 +33,19 @@ __all__ = [
     "resolve_geopotential",
     "delta_p",
     "MassIntegrator",
+    "TopographyAwareMeasure",
     "build_mass_integrator",
     "integrate_mass_full",
     "integrate_mass_zonal",
     "integrate_surface",
+    "planetary_area",
+    "to_per_area",
+    "normalize_dataset_per_area",
     "time_derivative",
     "zonal_mean",
+    "weighted_coverage",
+    "weighted_representative_zonal_mean",
+    "weighted_representative_eddy",
     "theta_coverage",
     "representative_zonal_mean",
     "representative_eddy",

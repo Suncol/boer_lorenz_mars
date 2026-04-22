@@ -10,15 +10,14 @@ import xarray as xr
 from .._validation import (
     ensure_matching_coordinates,
     normalize_field,
-    normalize_surface_field,
     normalize_zonal_field,
     require_dataarray,
 )
 from ..common.geopotential import broadcast_surface_field
 from ..common.integrals import build_mass_integrator, pressure_level_edges
-from ..common.zonal_ops import representative_zonal_mean
+from ..common.topography_measure import TopographyAwareMeasure
+from ..common.zonal_ops import weighted_representative_zonal_mean
 from ..constants_mars import MARS, MarsConstants
-from ..io.mask_below_ground import make_theta
 
 
 REFERENCE_SAMPLE_DIM = "reference_sample"
@@ -126,55 +125,6 @@ def _normalize_relative_surface_geopotential(surface_geopotential: np.ndarray) -
     if not np.all(np.isfinite(phis)):
         raise ValueError("Surface geopotential must remain finite for the stage-3 reference-state solve.")
     return phis - float(np.min(phis))
-
-
-def _physical_parcel_mass(
-    level: xr.DataArray,
-    surface_pressure: xr.DataArray,
-    cell_area: xr.DataArray,
-    *,
-    level_bounds: xr.DataArray | None = None,
-    constants: MarsConstants,
-) -> xr.DataArray:
-    surface_pressure = normalize_surface_field(surface_pressure, "surface_pressure")
-    cell_area = require_dataarray(cell_area, "cell_area").transpose("latitude", "longitude")
-    for coord_name in ("latitude", "longitude"):
-        reference = surface_pressure.coords[coord_name].values
-        current = cell_area.coords[coord_name].values
-        if not np.allclose(reference, current):
-            raise ValueError(f"Coordinate {coord_name!r} of 'cell_area' does not match the surface-pressure grid.")
-
-    level = require_dataarray(level, "level")
-    edges = pressure_level_edges(level, bounds=level_bounds)
-    lower_edge = xr.DataArray(
-        np.asarray(edges.values[:-1], dtype=float),
-        dims=("level",),
-        coords={"level": level.values},
-        name="level_lower_edge",
-    )
-    upper_edge = xr.DataArray(
-        np.asarray(edges.values[1:], dtype=float),
-        dims=("level",),
-        coords={"level": level.values},
-        name="level_upper_edge",
-    )
-
-    surface_pressure_4d = surface_pressure.expand_dims(level=level).transpose("time", "level", "latitude", "longitude")
-    lower_4d = lower_edge.broadcast_like(surface_pressure_4d)
-    upper_4d = upper_edge.broadcast_like(surface_pressure_4d)
-    cell_area_4d = cell_area.expand_dims(time=surface_pressure.coords["time"], level=level).transpose(
-        "time",
-        "level",
-        "latitude",
-        "longitude",
-    )
-
-    clipped_bottom = xr.apply_ufunc(np.minimum, surface_pressure_4d, lower_4d)
-    above_ground_dp = xr.where(surface_pressure_4d > upper_4d, clipped_bottom - upper_4d, 0.0)
-    parcel_mass = (above_ground_dp * cell_area_4d) / constants.g
-    parcel_mass.name = "parcel_mass"
-    parcel_mass.attrs["units"] = "kg"
-    return parcel_mass
 
 
 def _layer_geopotential_drop(
@@ -510,7 +460,11 @@ def _solve_reference_bottom_pressure(
         pressure_tolerance=pressure_tolerance,
     )
 
-    tolerance = pressure_tolerance * max(reference_top_pressure, 1.0)
+    # In partial-cell and clipped-column cases, the exact root can sit at the
+    # feasible-profile boundary. Using the top-pressure scale alone can make the
+    # bisection reject otherwise closed solutions with sub-millipascal residuals.
+    pressure_scale = spectrum.total_mass * constants.g / planetary_area
+    tolerance = pressure_tolerance * max(reference_top_pressure, pressure_scale, 1.0)
     if profile_lower.feasible and abs(profile_lower.top_residual) <= tolerance:
         return profile_lower, 1, True
     if profile_upper.feasible and abs(profile_upper.top_residual) <= tolerance:
@@ -541,6 +495,9 @@ def _solve_reference_bottom_pressure(
         else:
             upper = midpoint
             profile_upper = profile_mid
+
+        if best_profile.feasible and abs(upper - lower) <= tolerance:
+            return best_profile, iteration, True
 
     return best_profile, max_iterations, False
 
@@ -882,6 +839,7 @@ class ReferenceStateSolution:
     reference_surface_pressure: xr.DataArray
     reference_bottom_pressure: xr.DataArray
     reference_top_pressure: xr.DataArray
+    ps_effective: xr.DataArray | None = None
     pi_s: xr.DataArray | None = None
     pi_sZ: xr.DataArray | None = None
     iterations: xr.DataArray | None = None
@@ -1036,10 +994,12 @@ class KoehlerReferenceState:
         *,
         max_iterations: int = _LOWER_BOUNDARY_MAX_ITERATIONS,
         pressure_tolerance: float = _LOWER_BOUNDARY_PRESSURE_TOLERANCE,
+        surface_pressure_policy: str = "raise",
     ) -> None:
         self.constants = constants
         self.max_iterations = max_iterations
         self.pressure_tolerance = pressure_tolerance
+        self.surface_pressure_policy = surface_pressure_policy
 
     def solve(
         self,
@@ -1060,7 +1020,6 @@ class KoehlerReferenceState:
         ensure_matching_coordinates(potential_temperature, [pressure])
 
         surface_pressure = broadcast_surface_field(ps, potential_temperature, "ps")
-        theta_mask = make_theta(pressure, surface_pressure)
         integrator = build_mass_integrator(
             potential_temperature.coords["level"],
             potential_temperature.coords["latitude"],
@@ -1068,13 +1027,15 @@ class KoehlerReferenceState:
             constants=self.constants,
             level_bounds=level_bounds,
         )
-        parcel_mass = _physical_parcel_mass(
+        measure = TopographyAwareMeasure.from_surface_pressure(
             potential_temperature.coords["level"],
             surface_pressure,
-            integrator.cell_area,
+            integrator,
             level_bounds=level_bounds,
-            constants=self.constants,
+            pressure_tolerance=self.pressure_tolerance,
+            surface_pressure_policy=self.surface_pressure_policy,
         )
+        parcel_mass = measure.parcel_mass
 
         if phis is None:
             surface_geopotential = xr.zeros_like(potential_temperature.isel(level=0, drop=True), dtype=float)
@@ -1101,7 +1062,10 @@ class KoehlerReferenceState:
             integrator_cell_area=integrator.cell_area,
         )
 
-        representative_theta = representative_zonal_mean(potential_temperature, theta_mask).broadcast_like(
+        representative_theta = weighted_representative_zonal_mean(
+            potential_temperature,
+            measure.cell_fraction,
+        ).broadcast_like(
             potential_temperature
         )
         zonal_solution = _solve_reference_family(
@@ -1190,6 +1154,7 @@ class KoehlerReferenceState:
                 attrs={"units": "Pa", "long_name": "deepest reference-state surface pressure"},
             ),
             reference_top_pressure=reference_top_pressure.rename("reference_top_pressure"),
+            ps_effective=measure.effective_surface_pressure.rename("ps_effective"),
             pi_s=xr.DataArray(
                 full_solution["pi_s"],
                 dims=("time", "latitude", "longitude"),

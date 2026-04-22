@@ -22,6 +22,7 @@ from .helpers import (
     reference_layer_mass_from_interfaces,
     surface_geopotential,
     surface_mass_from_pi_s,
+    surface_pressure_policy_for_case,
     surface_pressure,
     temperature_from_theta_values,
 )
@@ -101,6 +102,11 @@ def _build_stress_case(
     solver = KoehlerReferenceState(
         pressure_tolerance=pressure_tolerance,
         max_iterations=max_iterations,
+        surface_pressure_policy=surface_pressure_policy_for_case(
+            ps,
+            level,
+            pressure_tolerance=pressure_tolerance,
+        ),
     )
     solution = solver.solve(pt, pressure, ps, phis=phis)
     return {
@@ -149,6 +155,11 @@ def _build_flat_partial_bottom_case(*, pressure_tolerance: float, max_iterations
     solver = KoehlerReferenceState(
         pressure_tolerance=pressure_tolerance,
         max_iterations=max_iterations,
+        surface_pressure_policy=surface_pressure_policy_for_case(
+            ps,
+            level,
+            pressure_tolerance=pressure_tolerance,
+        ),
     )
     solution = solver.solve(pt, pressure, ps, phis=phis)
     return {

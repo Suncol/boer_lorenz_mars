@@ -14,12 +14,106 @@ from .._validation import (
 )
 from ..common.geopotential import resolve_geopotential
 from ..common.integrals import MassIntegrator
+from ..common.topography_measure import TopographyAwareMeasure, resolve_exact_measure
 from ..common.time_derivatives import coordinate_derivative, time_derivative
-from ..common.zonal_ops import representative_eddy, representative_zonal_mean, theta_coverage, zonal_mean
+from ..common.zonal_ops import (
+    representative_eddy,
+    representative_zonal_mean,
+    theta_coverage,
+    weighted_coverage,
+    weighted_representative_eddy,
+    weighted_representative_zonal_mean,
+    zonal_mean,
+)
 from ..constants_mars import MARS, MarsConstants
 
 
 _METRIC_TOL = 1.0e-12
+
+
+def _weight_field(theta: xr.DataArray, measure: TopographyAwareMeasure | None) -> xr.DataArray:
+    theta = normalize_field(theta, "theta")
+    if measure is None:
+        return theta
+    ensure_matching_coordinates(theta, [measure.cell_fraction])
+    return measure.cell_fraction
+
+
+def _coverage_field(theta: xr.DataArray, measure: TopographyAwareMeasure | None) -> xr.DataArray:
+    weight = _weight_field(theta, measure)
+    return weighted_coverage(weight) if measure is not None else theta_coverage(weight)
+
+
+def _representative_mean(
+    field: xr.DataArray,
+    theta: xr.DataArray,
+    measure: TopographyAwareMeasure | None,
+) -> xr.DataArray:
+    weight = _weight_field(theta, measure)
+    if measure is None:
+        return representative_zonal_mean(field, weight)
+    return weighted_representative_zonal_mean(field, weight)
+
+
+def _representative_eddy_component(
+    field: xr.DataArray,
+    theta: xr.DataArray,
+    measure: TopographyAwareMeasure | None,
+) -> xr.DataArray:
+    weight = _weight_field(theta, measure)
+    if measure is None:
+        return representative_eddy(field, weight)
+    return weighted_representative_eddy(field, weight)
+
+
+def _safe_mass_ratio(numerator: xr.DataArray, denominator: xr.DataArray) -> xr.DataArray:
+    denominator = denominator.broadcast_like(numerator)
+    return xr.where(denominator > 0.0, numerator / denominator, 0.0)
+
+
+def _integrate_zonal_mass_aware(
+    integrand: xr.DataArray,
+    coverage: xr.DataArray,
+    integrator: MassIntegrator,
+    measure: TopographyAwareMeasure | None,
+) -> xr.DataArray:
+    if measure is None:
+        return integrator.integrate_zonal(integrand)
+    return measure.integrate_zonal(_safe_mass_ratio(integrand, coverage))
+
+
+def _effective_surface_pressure(ps: xr.DataArray, measure: TopographyAwareMeasure | None) -> xr.DataArray:
+    ps = normalize_surface_field(ps, "ps")
+    if measure is None:
+        return ps
+    ensure_matching_surface_coordinates(ps, [measure.effective_surface_pressure])
+    return measure.effective_surface_pressure
+
+
+def _annotate_quantity(result: xr.DataArray, *, units: str, base_quantity: str) -> xr.DataArray:
+    result.attrs["units"] = units
+    result.attrs["normalization"] = "global_integral"
+    result.attrs["base_quantity"] = base_quantity
+    return result
+
+
+def _resolved_measure(
+    integrator: MassIntegrator,
+    *,
+    theta: xr.DataArray | None = None,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
+    diagnostic_name: str,
+) -> TopographyAwareMeasure:
+    return resolve_exact_measure(
+        integrator,
+        measure=measure,
+        ps=ps,
+        theta=theta,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name=diagnostic_name,
+    )
 
 
 def _coerce_to_zonal(field: xr.DataArray, name: str) -> xr.DataArray:
@@ -276,6 +370,10 @@ def conversion_zonal_ape_to_ke_part1(
     alpha: xr.DataArray,
     theta: xr.DataArray,
     integrator: MassIntegrator,
+    *,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
 ) -> xr.DataArray:
     """Return ``C_Z1 = - ∫_M [Theta] [omega]_R [alpha]_R dm`` in Watts."""
 
@@ -283,33 +381,50 @@ def conversion_zonal_ape_to_ke_part1(
     alpha = normalize_field(alpha, "alpha")
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(omega, [alpha, theta])
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="C_Z1",
+    )
 
-    coverage = theta_coverage(theta)
-    omega_r = representative_zonal_mean(omega, theta)
-    alpha_r = representative_zonal_mean(alpha, theta)
+    coverage = _coverage_field(theta, measure)
+    omega_r = _representative_mean(omega, theta, measure)
+    alpha_r = _representative_mean(alpha, theta, measure)
     integrand = -coverage * omega_r * alpha_r
-    result = integrator.integrate_zonal(integrand)
+    result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "C_Z1"
-    result.attrs["units"] = "W"
-    return result
+    return _annotate_quantity(result, units="W", base_quantity="power")
 
 
 def conversion_zonal_ape_to_ke_part2(
     ps: xr.DataArray,
     phis: xr.DataArray,
     integrator: MassIntegrator,
+    *,
+    measure: TopographyAwareMeasure | None = None,
+    surface_pressure_policy: str = "raise",
 ) -> xr.DataArray:
     """Return ``C_Z2 = - ∫_S (dps/dt * Phi_s) dσ / g`` in Watts."""
 
     ps = normalize_surface_field(ps, "ps")
     phis = normalize_surface_field(phis, "phis")
     ensure_matching_surface_coordinates(ps, [phis])
+    measure = _resolved_measure(
+        integrator,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="C_Z2",
+    )
 
-    integrand = -time_derivative(ps) * phis
+    ps_effective = _effective_surface_pressure(ps, measure)
+    integrand = -time_derivative(ps_effective) * phis
     result = integrator.integrate_surface(integrand)
     result.name = "C_Z2"
-    result.attrs["units"] = "W"
-    return result
+    return _annotate_quantity(result, units="W", base_quantity="power")
 
 
 def conversion_zonal_ape_to_ke(
@@ -318,21 +433,40 @@ def conversion_zonal_ape_to_ke(
     theta: xr.DataArray,
     integrator: MassIntegrator,
     *,
+    measure: TopographyAwareMeasure | None = None,
     ps: xr.DataArray | None = None,
     phis: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
 ) -> xr.DataArray:
     """Return the total ``C_Z = C_Z1 + C_Z2`` in Watts."""
 
     if ps is None or phis is None:
         raise ValueError("Total C_Z requires both 'ps' and 'phis'.")
-    result = conversion_zonal_ape_to_ke_part1(omega, alpha, theta, integrator) + conversion_zonal_ape_to_ke_part2(
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="C_Z",
+    )
+    result = conversion_zonal_ape_to_ke_part1(
+        omega,
+        alpha,
+        theta,
+        integrator,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+    ) + conversion_zonal_ape_to_ke_part2(
         ps,
         phis,
         integrator,
+        measure=measure,
+        surface_pressure_policy=surface_pressure_policy,
     )
     result.name = "C_Z"
-    result.attrs["units"] = "W"
-    return result
+    return _annotate_quantity(result, units="W", base_quantity="power")
 
 
 def conversion_zonal_ape_to_eddy_ape(
@@ -344,6 +478,9 @@ def conversion_zonal_ape_to_eddy_ape(
     theta: xr.DataArray,
     integrator: MassIntegrator,
     *,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
     constants: MarsConstants = MARS,
 ) -> xr.DataArray:
     """Return ``C_A`` in Watts."""
@@ -356,13 +493,23 @@ def conversion_zonal_ape_to_eddy_ape(
     n_z = _coerce_to_zonal(n_z, "n_z")
     ensure_matching_coordinates(temperature, [u, v, omega, theta])
     _ensure_matching_zonal_coordinates(temperature, n_z, "n_z")
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="C_A",
+    )
 
-    temperature_star = representative_eddy(temperature, theta)
-    v_star = representative_eddy(v, theta)
-    omega_star = representative_eddy(omega, theta)
+    weight = _weight_field(theta, measure)
+    coverage = _coverage_field(theta, measure)
+    temperature_star = _representative_eddy_component(temperature, theta, measure)
+    v_star = _representative_eddy_component(v, theta, measure)
+    omega_star = _representative_eddy_component(omega, theta, measure)
 
-    meridional_flux = zonal_mean(theta * temperature_star * v_star)
-    vertical_flux = zonal_mean(theta * temperature_star * omega_star)
+    meridional_flux = zonal_mean(weight * temperature_star * v_star)
+    vertical_flux = zonal_mean(weight * temperature_star * omega_star)
 
     pressure = n_z.coords["level"]
     scalar = _exner_from_level(pressure, constants=constants) * n_z
@@ -375,10 +522,9 @@ def conversion_zonal_ape_to_eddy_ape(
     )
 
     integrand = -constants.cp * inverse_exner * advective_tendency
-    result = integrator.integrate_zonal(integrand)
+    result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "C_A"
-    result.attrs["units"] = "W"
-    return result
+    return _annotate_quantity(result, units="W", base_quantity="power")
 
 
 def conversion_eddy_ape_to_ke(
@@ -386,6 +532,10 @@ def conversion_eddy_ape_to_ke(
     alpha: xr.DataArray,
     theta: xr.DataArray,
     integrator: MassIntegrator,
+    *,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
 ) -> xr.DataArray:
     """Return ``C_E = - ∫_M [Theta omega* alpha*] dm`` in Watts."""
 
@@ -393,14 +543,23 @@ def conversion_eddy_ape_to_ke(
     alpha = normalize_field(alpha, "alpha")
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(omega, [alpha, theta])
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="C_E",
+    )
 
-    omega_star = representative_eddy(omega, theta)
-    alpha_star = representative_eddy(alpha, theta)
-    integrand = -zonal_mean(theta * omega_star * alpha_star)
-    result = integrator.integrate_zonal(integrand)
+    weight = _weight_field(theta, measure)
+    coverage = _coverage_field(theta, measure)
+    omega_star = _representative_eddy_component(omega, theta, measure)
+    alpha_star = _representative_eddy_component(alpha, theta, measure)
+    integrand = -zonal_mean(weight * omega_star * alpha_star)
+    result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "C_E"
-    result.attrs["units"] = "W"
-    return result
+    return _annotate_quantity(result, units="W", base_quantity="power")
 
 
 def conversion_zonal_ke_to_eddy_ke_part1(
@@ -410,6 +569,9 @@ def conversion_zonal_ke_to_eddy_ke_part1(
     theta: xr.DataArray,
     integrator: MassIntegrator,
     *,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
     constants: MarsConstants = MARS,
 ) -> xr.DataArray:
     """Return ``C_K1`` in Watts."""
@@ -419,23 +581,33 @@ def conversion_zonal_ke_to_eddy_ke_part1(
     omega = normalize_field(omega, "omega")
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(u, [v, omega, theta])
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="C_K1",
+    )
 
     _, tanphi, metric = _metric_factors(u.coords["latitude"], constants=constants)
 
-    u_r = representative_zonal_mean(u, theta)
-    v_r = representative_zonal_mean(v, theta)
-    u_star = representative_eddy(u, theta)
-    v_star = representative_eddy(v, theta)
-    omega_star = representative_eddy(omega, theta)
+    weight = _weight_field(theta, measure)
+    coverage = _coverage_field(theta, measure)
+    u_r = _representative_mean(u, theta, measure)
+    v_r = _representative_mean(v, theta, measure)
+    u_star = _representative_eddy_component(u, theta, measure)
+    v_star = _representative_eddy_component(v, theta, measure)
+    omega_star = _representative_eddy_component(omega, theta, measure)
 
     mean_u_shear = u_r / metric
     mean_v_shear = v_r / metric
 
-    uv_flux = zonal_mean(theta * u_star * v_star)
-    uomega_flux = zonal_mean(theta * u_star * omega_star)
-    vv_flux = zonal_mean(theta * v_star * v_star)
-    vomega_flux = zonal_mean(theta * v_star * omega_star)
-    eddy_speed_sq = zonal_mean(theta * (u_star * u_star + v_star * v_star))
+    uv_flux = zonal_mean(weight * u_star * v_star)
+    uomega_flux = zonal_mean(weight * u_star * omega_star)
+    vv_flux = zonal_mean(weight * v_star * v_star)
+    vomega_flux = zonal_mean(weight * v_star * omega_star)
+    eddy_speed_sq = zonal_mean(weight * (u_star * u_star + v_star * v_star))
 
     u_block = _zonal_advective_operator(
         uv_flux,
@@ -451,10 +623,9 @@ def conversion_zonal_ke_to_eddy_ke_part1(
     ) - (tanphi / constants.a) * eddy_speed_sq * mean_v_shear
 
     integrand = -metric * (u_block + v_block)
-    result = integrator.integrate_zonal(integrand)
+    result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "C_K1"
-    result.attrs["units"] = "W"
-    return result
+    return _annotate_quantity(result, units="W", base_quantity="power")
 
 
 def conversion_zonal_ke_to_eddy_ke_part2(
@@ -464,11 +635,13 @@ def conversion_zonal_ke_to_eddy_ke_part2(
     theta: xr.DataArray,
     integrator: MassIntegrator,
     *,
+    measure: TopographyAwareMeasure | None = None,
     geopotential: xr.DataArray | None = None,
     temperature: xr.DataArray | None = None,
     pressure: xr.DataArray | None = None,
     ps: xr.DataArray | None = None,
     phis: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
     constants: MarsConstants = MARS,
 ) -> xr.DataArray:
     """Return ``C_K2`` in Watts."""
@@ -478,6 +651,15 @@ def conversion_zonal_ke_to_eddy_ke_part2(
     omega = normalize_field(omega, "omega")
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(u, [v, omega, theta])
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="C_K2",
+    )
+    coverage = _coverage_field(theta, measure)
     valid_mask = (theta > 0.0).rename("theta_valid_mask")
 
     phi = resolve_geopotential(
@@ -495,26 +677,26 @@ def conversion_zonal_ke_to_eddy_ke_part2(
 
     # Boer (1989) Eq. (5') is written in terms of [Theta ∂Phi*/∂x], so the
     # derivatives must be taken only on the above-ground domain.
-    phi_star = representative_eddy(phi, theta)
+    weight = _weight_field(theta, measure)
+    phi_star = _representative_eddy_component(phi, theta, measure)
     dphi_dt_star = time_derivative(phi_star, valid_mask=valid_mask)
     dphi_dp_star = _pressure_derivative(phi_star, valid_mask=valid_mask)
     dphi_dx_star = _longitude_gradient(phi_star, constants=constants, valid_mask=valid_mask)
     dphi_dy_star = _meridional_gradient(phi_star, constants=constants, valid_mask=valid_mask)
 
-    u_r = representative_zonal_mean(u, theta)
-    v_r = representative_zonal_mean(v, theta)
-    omega_r = representative_zonal_mean(omega, theta)
+    u_r = _representative_mean(u, theta, measure)
+    v_r = _representative_mean(v, theta, measure)
+    omega_r = _representative_mean(omega, theta, measure)
 
-    tendency_term = zonal_mean(theta * dphi_dt_star)
-    gradient_x_term = zonal_mean(theta * dphi_dx_star)
-    gradient_y_term = zonal_mean(theta * dphi_dy_star)
-    pressure_term = zonal_mean(theta * dphi_dp_star)
+    tendency_term = zonal_mean(weight * dphi_dt_star)
+    gradient_x_term = zonal_mean(weight * dphi_dx_star)
+    gradient_y_term = zonal_mean(weight * dphi_dy_star)
+    pressure_term = zonal_mean(weight * dphi_dp_star)
 
     integrand = tendency_term + u_r * gradient_x_term + v_r * gradient_y_term + omega_r * pressure_term
-    result = integrator.integrate_zonal(integrand)
+    result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "C_K2"
-    result.attrs["units"] = "W"
-    return result
+    return _annotate_quantity(result, units="W", base_quantity="power")
 
 
 def conversion_zonal_ke_to_eddy_ke(
@@ -524,21 +706,34 @@ def conversion_zonal_ke_to_eddy_ke(
     theta: xr.DataArray,
     integrator: MassIntegrator,
     *,
+    measure: TopographyAwareMeasure | None = None,
     geopotential: xr.DataArray | None = None,
     temperature: xr.DataArray | None = None,
     pressure: xr.DataArray | None = None,
     ps: xr.DataArray | None = None,
     phis: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
     constants: MarsConstants = MARS,
 ) -> xr.DataArray:
     """Return the total ``C_K = C_K1 + C_K2`` in Watts."""
 
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="C_K",
+    )
     result = conversion_zonal_ke_to_eddy_ke_part1(
         u,
         v,
         omega,
         theta,
         integrator,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
         constants=constants,
     ) + conversion_zonal_ke_to_eddy_ke_part2(
         u,
@@ -546,16 +741,17 @@ def conversion_zonal_ke_to_eddy_ke(
         omega,
         theta,
         integrator,
+        measure=measure,
         geopotential=geopotential,
         temperature=temperature,
         pressure=pressure,
         ps=ps,
         phis=phis,
+        surface_pressure_policy=surface_pressure_policy,
         constants=constants,
     )
     result.name = "C_K"
-    result.attrs["units"] = "W"
-    return result
+    return _annotate_quantity(result, units="W", base_quantity="power")
 
 
 C_Z1 = conversion_zonal_ape_to_ke_part1

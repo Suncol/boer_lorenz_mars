@@ -22,7 +22,16 @@ from .._validation import (
 )
 from ..common.grid_weights import longitude_weights
 from ..common.integrals import MassIntegrator
-from ..common.zonal_ops import representative_eddy, representative_zonal_mean, theta_coverage, zonal_mean
+from ..common.topography_measure import TopographyAwareMeasure, resolve_exact_measure
+from ..common.zonal_ops import (
+    representative_eddy,
+    representative_zonal_mean,
+    theta_coverage,
+    weighted_coverage,
+    weighted_representative_eddy,
+    weighted_representative_zonal_mean,
+    zonal_mean,
+)
 from ..constants_mars import MARS, MarsConstants
 from ..reference_state.interpolate_isentropes import potential_temperature
 
@@ -42,6 +51,113 @@ _SURFACE_ZONAL_PRESSURE_KEYS = (
     "surface_reference_pressure_zonal",
     "reference_surface_pressure_zonal",
 )
+
+
+def _weight_field(theta: xr.DataArray, measure: TopographyAwareMeasure | None) -> xr.DataArray:
+    theta = normalize_field(theta, "theta")
+    if measure is None:
+        return theta
+    ensure_matching_coordinates(theta, [measure.cell_fraction])
+    return measure.cell_fraction
+
+
+def _coverage_field(theta: xr.DataArray, measure: TopographyAwareMeasure | None) -> xr.DataArray:
+    weight = _weight_field(theta, measure)
+    return weighted_coverage(weight) if measure is not None else theta_coverage(weight)
+
+
+def _representative_mean(
+    field: xr.DataArray,
+    theta: xr.DataArray,
+    measure: TopographyAwareMeasure | None,
+) -> xr.DataArray:
+    weight = _weight_field(theta, measure)
+    if measure is None:
+        return representative_zonal_mean(field, weight)
+    return weighted_representative_zonal_mean(field, weight)
+
+
+def _representative_eddy(
+    field: xr.DataArray,
+    theta: xr.DataArray,
+    measure: TopographyAwareMeasure | None,
+) -> xr.DataArray:
+    weight = _weight_field(theta, measure)
+    if measure is None:
+        return representative_eddy(field, weight)
+    return weighted_representative_eddy(field, weight)
+
+
+def _safe_mass_ratio(numerator: xr.DataArray, denominator: xr.DataArray) -> xr.DataArray:
+    denominator = denominator.broadcast_like(numerator)
+    return xr.where(denominator > 0.0, numerator / denominator, 0.0)
+
+
+def _integrate_full_mass_aware(
+    integrand: xr.DataArray,
+    weight: xr.DataArray,
+    integrator: MassIntegrator,
+    measure: TopographyAwareMeasure | None,
+) -> xr.DataArray:
+    if measure is None:
+        return integrator.integrate_full(integrand)
+    return measure.integrate_full(_safe_mass_ratio(integrand, weight))
+
+
+def _integrate_zonal_mass_aware(
+    integrand: xr.DataArray,
+    coverage: xr.DataArray,
+    integrator: MassIntegrator,
+    measure: TopographyAwareMeasure | None,
+) -> xr.DataArray:
+    if measure is None:
+        return integrator.integrate_zonal(integrand)
+    return measure.integrate_zonal(_safe_mass_ratio(integrand, coverage))
+
+
+def _effective_surface_pressure(ps: xr.DataArray, measure: TopographyAwareMeasure | None) -> xr.DataArray:
+    ps = normalize_surface_field(ps, "ps")
+    if measure is None:
+        return ps
+    ensure_matching_surface_coordinates(ps, [measure.effective_surface_pressure])
+    return measure.effective_surface_pressure
+
+
+def _annotate_quantity(
+    result: xr.DataArray,
+    *,
+    units: str,
+    base_quantity: str,
+    surface_term_included: bool | None = None,
+    long_name: str | None = None,
+) -> xr.DataArray:
+    result.attrs["units"] = units
+    result.attrs["normalization"] = "global_integral"
+    result.attrs["base_quantity"] = base_quantity
+    if surface_term_included is not None:
+        result.attrs["surface_term_included"] = surface_term_included
+    if long_name is not None:
+        result.attrs["long_name"] = long_name
+    return result
+
+
+def _resolved_measure(
+    integrator: MassIntegrator,
+    *,
+    theta: xr.DataArray | None = None,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
+    diagnostic_name: str,
+) -> TopographyAwareMeasure:
+    return resolve_exact_measure(
+        integrator,
+        measure=measure,
+        ps=ps,
+        theta=theta,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name=diagnostic_name,
+    )
 
 
 def _lookup_reference_component(reference_state: Any, candidates: tuple[str, ...]) -> Any | None:
@@ -321,6 +437,10 @@ def total_horizontal_ke(
     v: xr.DataArray,
     theta: xr.DataArray,
     integrator: MassIntegrator,
+    *,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
 ) -> xr.DataArray:
     """Return ``∫_M 0.5 Theta (u² + v²) dm`` in Joules."""
 
@@ -328,12 +448,20 @@ def total_horizontal_ke(
     v = normalize_field(v, "v")
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(u, [v, theta])
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="total_horizontal_ke",
+    )
 
-    integrand = 0.5 * theta * (u**2 + v**2)
-    result = integrator.integrate_full(integrand)
+    weight = _weight_field(theta, measure)
+    integrand = 0.5 * weight * (u**2 + v**2)
+    result = _integrate_full_mass_aware(integrand, weight, integrator, measure)
     result.name = "total_horizontal_ke"
-    result.attrs["units"] = "J"
-    return result
+    return _annotate_quantity(result, units="J", base_quantity="energy")
 
 
 def kinetic_energy_zonal(
@@ -341,6 +469,10 @@ def kinetic_energy_zonal(
     v: xr.DataArray,
     theta: xr.DataArray,
     integrator: MassIntegrator,
+    *,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
 ) -> xr.DataArray:
     """Return the zonal kinetic-energy reservoir ``K_Z`` in Joules."""
 
@@ -348,15 +480,22 @@ def kinetic_energy_zonal(
     v = normalize_field(v, "v")
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(u, [v, theta])
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="kinetic_energy_zonal",
+    )
 
-    coverage = theta_coverage(theta)
-    u_r = representative_zonal_mean(u, theta)
-    v_r = representative_zonal_mean(v, theta)
+    coverage = _coverage_field(theta, measure)
+    u_r = _representative_mean(u, theta, measure)
+    v_r = _representative_mean(v, theta, measure)
     integrand = 0.5 * coverage * (u_r**2 + v_r**2)
-    result = integrator.integrate_zonal(integrand)
+    result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "K_Z"
-    result.attrs["units"] = "J"
-    return result
+    return _annotate_quantity(result, units="J", base_quantity="energy")
 
 
 def kinetic_energy_eddy(
@@ -364,6 +503,10 @@ def kinetic_energy_eddy(
     v: xr.DataArray,
     theta: xr.DataArray,
     integrator: MassIntegrator,
+    *,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
 ) -> xr.DataArray:
     """Return the eddy kinetic-energy reservoir ``K_E`` in Joules."""
 
@@ -371,14 +514,23 @@ def kinetic_energy_eddy(
     v = normalize_field(v, "v")
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(u, [v, theta])
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="kinetic_energy_eddy",
+    )
 
-    u_star = representative_eddy(u, theta)
-    v_star = representative_eddy(v, theta)
-    integrand = 0.5 * zonal_mean(theta * (u_star**2 + v_star**2))
-    result = integrator.integrate_zonal(integrand)
+    weight = _weight_field(theta, measure)
+    coverage = _coverage_field(theta, measure)
+    u_star = _representative_eddy(u, theta, measure)
+    v_star = _representative_eddy(v, theta, measure)
+    integrand = 0.5 * zonal_mean(weight * (u_star**2 + v_star**2))
+    result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "K_E"
-    result.attrs["units"] = "J"
-    return result
+    return _annotate_quantity(result, units="J", base_quantity="energy")
 
 
 def available_potential_energy_zonal_part1(
@@ -388,6 +540,9 @@ def available_potential_energy_zonal_part1(
     integrator: MassIntegrator,
     reference_state: Any | None = None,
     *,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
     potential_temperature_field: xr.DataArray | None = None,
     pi_z: xr.DataArray | float | None = None,
     n_z: xr.DataArray | float | None = None,
@@ -398,6 +553,14 @@ def available_potential_energy_zonal_part1(
     pressure = normalize_field(pressure, "pressure")
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(temperature, [pressure, theta])
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="A_Z1",
+    )
 
     constants = integrator.constants
     if potential_temperature_field is None:
@@ -413,10 +576,10 @@ def available_potential_energy_zonal_part1(
         )
         ensure_matching_coordinates(temperature, [potential_temperature_field])
 
-    coverage = theta_coverage(theta)
-    temperature_r = representative_zonal_mean(temperature, theta)
-    pressure_r = representative_zonal_mean(pressure, theta)
-    representative_theta = representative_zonal_mean(potential_temperature_field, theta)
+    coverage = _coverage_field(theta, measure)
+    temperature_r = _representative_mean(temperature, theta, measure)
+    pressure_r = _representative_mean(pressure, theta, measure)
+    representative_theta = _representative_mean(potential_temperature_field, theta, measure)
     n_z_field = _resolve_efficiency_factor(
         reference_state,
         n_z,
@@ -430,12 +593,15 @@ def available_potential_energy_zonal_part1(
     )
 
     integrand = constants.cp * coverage * n_z_field * temperature_r
-    result = integrator.integrate_zonal(integrand)
+    result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "A_Z1"
-    result.attrs["units"] = "J"
-    result.attrs["long_name"] = "zonal exact available potential energy body term"
-    result.attrs["surface_term_included"] = False
-    return result
+    return _annotate_quantity(
+        result,
+        units="J",
+        base_quantity="energy",
+        long_name="zonal exact available potential energy body term",
+        surface_term_included=False,
+    )
 
 
 def available_potential_energy_eddy_part1(
@@ -445,6 +611,9 @@ def available_potential_energy_eddy_part1(
     integrator: MassIntegrator,
     reference_state: Any | None = None,
     *,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
     potential_temperature_field: xr.DataArray | None = None,
     pi: xr.DataArray | float | None = None,
     pi_z: xr.DataArray | float | None = None,
@@ -457,6 +626,14 @@ def available_potential_energy_eddy_part1(
     pressure = normalize_field(pressure, "pressure")
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(temperature, [pressure, theta])
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="A_E1",
+    )
 
     constants = integrator.constants
     if potential_temperature_field is None:
@@ -483,30 +660,36 @@ def available_potential_energy_eddy_part1(
         pressure_field=pressure,
         potential_temperature_field=potential_temperature_field,
     )
+    coverage = _coverage_field(theta, measure)
+    weight = _weight_field(theta, measure)
     n_z_field = _resolve_efficiency_factor(
         reference_state,
         n_z,
         pi_z,
-        theta_coverage(theta),
+        coverage,
         zonal=True,
         constants=constants,
         output_name="N_Z",
-        pressure_field=representative_zonal_mean(pressure, theta),
-        potential_temperature_field=representative_zonal_mean(
+        pressure_field=_representative_mean(pressure, theta, measure),
+        potential_temperature_field=_representative_mean(
             potential_temperature_field,
             theta,
+            measure,
         ),
     )
 
     integrand = constants.cp * zonal_mean(
-        theta * (n_field - n_z_field.broadcast_like(temperature)) * temperature
+        weight * (n_field - n_z_field.broadcast_like(temperature)) * temperature
     )
-    result = integrator.integrate_zonal(integrand)
+    result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "A_E1"
-    result.attrs["units"] = "J"
-    result.attrs["long_name"] = "eddy exact available potential energy body term"
-    result.attrs["surface_term_included"] = False
-    return result
+    return _annotate_quantity(
+        result,
+        units="J",
+        base_quantity="energy",
+        long_name="eddy exact available potential energy body term",
+        surface_term_included=False,
+    )
 
 
 def available_potential_energy_part1(
@@ -516,6 +699,9 @@ def available_potential_energy_part1(
     integrator: MassIntegrator,
     reference_state: Any | None = None,
     *,
+    measure: TopographyAwareMeasure | None = None,
+    ps: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
     potential_temperature_field: xr.DataArray | None = None,
     pi: xr.DataArray | float | None = None,
     n: xr.DataArray | float | None = None,
@@ -526,6 +712,14 @@ def available_potential_energy_part1(
     pressure = normalize_field(pressure, "pressure")
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(temperature, [pressure, theta])
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="A_1",
+    )
 
     constants = integrator.constants
     if potential_temperature_field is None:
@@ -553,13 +747,17 @@ def available_potential_energy_part1(
         potential_temperature_field=potential_temperature_field,
     )
 
-    integrand = constants.cp * theta * n_field * temperature
-    result = integrator.integrate_full(integrand)
+    weight = _weight_field(theta, measure)
+    integrand = constants.cp * weight * n_field * temperature
+    result = _integrate_full_mass_aware(integrand, weight, integrator, measure)
     result.name = "A_1"
-    result.attrs["units"] = "J"
-    result.attrs["long_name"] = "exact available potential energy body term"
-    result.attrs["surface_term_included"] = False
-    return result
+    return _annotate_quantity(
+        result,
+        units="J",
+        base_quantity="energy",
+        long_name="exact available potential energy body term",
+        surface_term_included=False,
+    )
 
 
 def available_potential_energy_zonal_part2(
@@ -568,6 +766,8 @@ def available_potential_energy_zonal_part2(
     integrator: MassIntegrator,
     reference_state: Any | None = None,
     *,
+    measure: TopographyAwareMeasure | None = None,
+    surface_pressure_policy: str = "raise",
     pi_sZ: xr.DataArray | float | None = None,
 ) -> xr.DataArray:
     """Return ``A_Z2 = ∫_S (ps - pi_sZ) Phi_s dσ / g`` in Joules."""
@@ -575,21 +775,32 @@ def available_potential_energy_zonal_part2(
     ps = normalize_surface_field(ps, "ps")
     phis = normalize_surface_field(phis, "phis")
     ensure_matching_surface_coordinates(ps, [phis])
+    measure = _resolved_measure(
+        integrator,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="A_Z2",
+    )
 
+    ps_effective = _effective_surface_pressure(ps, measure)
     pi_sZ_field = _resolve_surface_reference_pressure(
         reference_state,
         pi_sZ,
-        ps,
+        ps_effective,
         output_name="pi_sZ",
         pressure_keys=_SURFACE_ZONAL_PRESSURE_KEYS,
     )
-    integrand = (ps - pi_sZ_field) * phis
+    integrand = (ps_effective - pi_sZ_field) * phis
     result = integrator.integrate_surface(integrand)
     result.name = "A_Z2"
-    result.attrs["units"] = "J"
-    result.attrs["long_name"] = "zonal exact available potential energy topographic term"
-    result.attrs["surface_term_included"] = True
-    return result
+    return _annotate_quantity(
+        result,
+        units="J",
+        base_quantity="energy",
+        long_name="zonal exact available potential energy topographic term",
+        surface_term_included=True,
+    )
 
 
 def available_potential_energy_eddy_part2(
@@ -598,6 +809,8 @@ def available_potential_energy_eddy_part2(
     integrator: MassIntegrator,
     reference_state: Any | None = None,
     *,
+    measure: TopographyAwareMeasure | None = None,
+    surface_pressure_policy: str = "raise",
     pi_s: xr.DataArray | float | None = None,
     pi_sZ: xr.DataArray | float | None = None,
 ) -> xr.DataArray:
@@ -606,28 +819,39 @@ def available_potential_energy_eddy_part2(
     ps = normalize_surface_field(ps, "ps")
     phis = normalize_surface_field(phis, "phis")
     ensure_matching_surface_coordinates(ps, [phis])
+    measure = _resolved_measure(
+        integrator,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="A_E2",
+    )
 
+    ps_effective = _effective_surface_pressure(ps, measure)
     pi_s_field = _resolve_surface_reference_pressure(
         reference_state,
         pi_s,
-        ps,
+        ps_effective,
         output_name="pi_s",
         pressure_keys=_SURFACE_PRESSURE_KEYS,
     )
     pi_sZ_field = _resolve_surface_reference_pressure(
         reference_state,
         pi_sZ,
-        ps,
+        ps_effective,
         output_name="pi_sZ",
         pressure_keys=_SURFACE_ZONAL_PRESSURE_KEYS,
     )
     integrand = (pi_sZ_field - pi_s_field) * phis
     result = integrator.integrate_surface(integrand)
     result.name = "A_E2"
-    result.attrs["units"] = "J"
-    result.attrs["long_name"] = "eddy exact available potential energy topographic term"
-    result.attrs["surface_term_included"] = True
-    return result
+    return _annotate_quantity(
+        result,
+        units="J",
+        base_quantity="energy",
+        long_name="eddy exact available potential energy topographic term",
+        surface_term_included=True,
+    )
 
 
 def available_potential_energy_part2(
@@ -636,6 +860,8 @@ def available_potential_energy_part2(
     integrator: MassIntegrator,
     reference_state: Any | None = None,
     *,
+    measure: TopographyAwareMeasure | None = None,
+    surface_pressure_policy: str = "raise",
     pi_s: xr.DataArray | float | None = None,
 ) -> xr.DataArray:
     """Return ``A_2 = ∫_S (ps - pi_s) Phi_s dσ / g`` in Joules."""
@@ -643,21 +869,32 @@ def available_potential_energy_part2(
     ps = normalize_surface_field(ps, "ps")
     phis = normalize_surface_field(phis, "phis")
     ensure_matching_surface_coordinates(ps, [phis])
+    measure = _resolved_measure(
+        integrator,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="A_2",
+    )
 
+    ps_effective = _effective_surface_pressure(ps, measure)
     pi_s_field = _resolve_surface_reference_pressure(
         reference_state,
         pi_s,
-        ps,
+        ps_effective,
         output_name="pi_s",
         pressure_keys=_SURFACE_PRESSURE_KEYS,
     )
-    integrand = (ps - pi_s_field) * phis
+    integrand = (ps_effective - pi_s_field) * phis
     result = integrator.integrate_surface(integrand)
     result.name = "A_2"
-    result.attrs["units"] = "J"
-    result.attrs["long_name"] = "exact available potential energy topographic term"
-    result.attrs["surface_term_included"] = True
-    return result
+    return _annotate_quantity(
+        result,
+        units="J",
+        base_quantity="energy",
+        long_name="exact available potential energy topographic term",
+        surface_term_included=True,
+    )
 
 
 def available_potential_energy_zonal(
@@ -667,8 +904,10 @@ def available_potential_energy_zonal(
     integrator: MassIntegrator,
     reference_state: Any | None = None,
     *,
+    measure: TopographyAwareMeasure | None = None,
     ps: xr.DataArray | None = None,
     phis: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
     potential_temperature_field: xr.DataArray | None = None,
     pi_z: xr.DataArray | float | None = None,
     n_z: xr.DataArray | float | None = None,
@@ -678,12 +917,23 @@ def available_potential_energy_zonal(
 
     if ps is None or phis is None:
         raise ValueError("Total exact A_Z requires both 'ps' and 'phis'.")
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="A_Z",
+    )
     result = available_potential_energy_zonal_part1(
         temperature,
         pressure,
         theta,
         integrator,
         reference_state=reference_state,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
         potential_temperature_field=potential_temperature_field,
         pi_z=pi_z,
         n_z=n_z,
@@ -692,12 +942,12 @@ def available_potential_energy_zonal(
         phis,
         integrator,
         reference_state=reference_state,
+        measure=measure,
+        surface_pressure_policy=surface_pressure_policy,
         pi_sZ=pi_sZ,
     )
     result.name = "A_Z"
-    result.attrs["units"] = "J"
-    result.attrs["surface_term_included"] = True
-    return result
+    return _annotate_quantity(result, units="J", base_quantity="energy", surface_term_included=True)
 
 
 def available_potential_energy_eddy(
@@ -707,8 +957,10 @@ def available_potential_energy_eddy(
     integrator: MassIntegrator,
     reference_state: Any | None = None,
     *,
+    measure: TopographyAwareMeasure | None = None,
     ps: xr.DataArray | None = None,
     phis: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
     potential_temperature_field: xr.DataArray | None = None,
     pi: xr.DataArray | float | None = None,
     pi_z: xr.DataArray | float | None = None,
@@ -721,12 +973,23 @@ def available_potential_energy_eddy(
 
     if ps is None or phis is None:
         raise ValueError("Total exact A_E requires both 'ps' and 'phis'.")
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="A_E",
+    )
     result = available_potential_energy_eddy_part1(
         temperature,
         pressure,
         theta,
         integrator,
         reference_state=reference_state,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
         potential_temperature_field=potential_temperature_field,
         pi=pi,
         pi_z=pi_z,
@@ -737,13 +1000,13 @@ def available_potential_energy_eddy(
         phis,
         integrator,
         reference_state=reference_state,
+        measure=measure,
+        surface_pressure_policy=surface_pressure_policy,
         pi_s=pi_s,
         pi_sZ=pi_sZ,
     )
     result.name = "A_E"
-    result.attrs["units"] = "J"
-    result.attrs["surface_term_included"] = True
-    return result
+    return _annotate_quantity(result, units="J", base_quantity="energy", surface_term_included=True)
 
 
 def available_potential_energy(
@@ -753,8 +1016,10 @@ def available_potential_energy(
     integrator: MassIntegrator,
     reference_state: Any | None = None,
     *,
+    measure: TopographyAwareMeasure | None = None,
     ps: xr.DataArray | None = None,
     phis: xr.DataArray | None = None,
+    surface_pressure_policy: str = "raise",
     potential_temperature_field: xr.DataArray | None = None,
     pi: xr.DataArray | float | None = None,
     n: xr.DataArray | float | None = None,
@@ -764,12 +1029,23 @@ def available_potential_energy(
 
     if ps is None or phis is None:
         raise ValueError("Total exact A requires both 'ps' and 'phis'.")
+    measure = _resolved_measure(
+        integrator,
+        theta=theta,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
+        diagnostic_name="A",
+    )
     result = available_potential_energy_part1(
         temperature,
         pressure,
         theta,
         integrator,
         reference_state=reference_state,
+        measure=measure,
+        ps=ps,
+        surface_pressure_policy=surface_pressure_policy,
         potential_temperature_field=potential_temperature_field,
         pi=pi,
         n=n,
@@ -778,12 +1054,12 @@ def available_potential_energy(
         phis,
         integrator,
         reference_state=reference_state,
+        measure=measure,
+        surface_pressure_policy=surface_pressure_policy,
         pi_s=pi_s,
     )
     result.name = "A"
-    result.attrs["units"] = "J"
-    result.attrs["surface_term_included"] = True
-    return result
+    return _annotate_quantity(result, units="J", base_quantity="energy", surface_term_included=True)
 
 
 total_available_potential_energy_part1 = available_potential_energy_part1

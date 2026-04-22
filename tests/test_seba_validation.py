@@ -11,7 +11,7 @@ from mars_exact_lec.constants_mars import MARS
 from mars_exact_lec.io.mask_below_ground import make_theta
 from mars_exact_lec.validation import _resolve_live_seba_energy_budget, seba_total_hke_per_level
 
-from .helpers import full_field, make_coords, pressure_field, seba_dataset, surface_pressure
+from .helpers import full_field, make_coords, pressure_field, seba_dataset, surface_pressure, surface_pressure_policy_for_case
 
 pytestmark = pytest.mark.live_seba
 
@@ -104,7 +104,8 @@ def test_seba_hke_matches_direct_grid_hke_and_column_integral(live_seba_runtime)
     np.testing.assert_allclose(hke_level.values, direct_hke_level.values, rtol=5e-4, atol=1e-6)
 
     integrator = build_mass_integrator(level, latitude, longitude)
-    direct_total = total_horizontal_ke(u, v, theta, integrator)
+    policy = surface_pressure_policy_for_case(ps, level)
+    direct_total = total_horizontal_ke(u, v, theta, integrator, ps=ps, surface_pressure_policy=policy)
     seba_column_total = (hke_level * delta_p(level) / MARS.g).sum(dim="level") * areas
 
     np.testing.assert_allclose(seba_column_total.values, direct_total.values, rtol=5e-4, atol=1e-4)

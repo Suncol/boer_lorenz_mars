@@ -411,6 +411,13 @@ def surface_mass_from_pi_s(pi_s, reference_top_pressure, cell_area, *, constants
     return ((pi_s - reference_top_pressure) * cell_area).sum(dim=("latitude", "longitude")) / constants.g
 
 
+def surface_pressure_policy_for_case(ps, level, *, level_bounds=None, pressure_tolerance: float = 1.0e-6) -> str:
+    edges = pressure_level_edges(level, bounds=level_bounds)
+    deepest_level_edge = float(edges.isel(level_edge=0))
+    max_ps = float(np.asarray(ps.values, dtype=float).max())
+    return "clip" if max_ps > deepest_level_edge + float(pressure_tolerance) else "raise"
+
+
 def pressure_inside_reference_layer(phi_target, phi_bottom, p_bottom, theta_layer, *, constants=MARS):
     phi_target = np.asarray(phi_target, dtype=float)
     exner_bottom = (float(p_bottom) / constants.p00) ** constants.kappa

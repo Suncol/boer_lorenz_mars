@@ -127,6 +127,7 @@ class MassIntegrator:
     delta_p: xr.DataArray
     cell_area: xr.DataArray
     zonal_band_area: xr.DataArray
+    level_bounds: xr.DataArray | None = None
     constants: MarsConstants = MARS
 
     def __post_init__(self) -> None:
@@ -136,6 +137,14 @@ class MassIntegrator:
         if np.any(np.asarray(delta_p.values, dtype=float) <= 0.0):
             raise ValueError("'delta_p' must contain strictly positive pressure thicknesses.")
         object.__setattr__(self, "delta_p", delta_p)
+        if self.level_bounds is not None:
+            level_bounds = require_dataarray(self.level_bounds, "level_bounds")
+            if set(level_bounds.dims) != {"level", "bounds"}:
+                raise ValueError("'level_bounds' must contain exactly the dims ('level', 'bounds').")
+            level_bounds = level_bounds.transpose("level", "bounds")
+            if not _coordinate_matches(delta_p, level_bounds, "level"):
+                raise ValueError("Level bounds must match the integrator level coordinate.")
+            object.__setattr__(self, "level_bounds", level_bounds)
         object.__setattr__(
             self,
             "cell_area",
@@ -146,6 +155,10 @@ class MassIntegrator:
             "zonal_band_area",
             self.zonal_band_area.transpose("latitude"),
         )
+
+    @property
+    def level_edges(self) -> xr.DataArray:
+        return pressure_level_edges(self.delta_p.coords["level"], bounds=self.level_bounds)
 
     @property
     def full_mass_weights(self) -> xr.DataArray:
@@ -222,8 +235,9 @@ def build_mass_integrator(
     level = normalize_coordinate(level, "level")
     latitude = normalize_coordinate(latitude, "latitude")
     longitude = normalize_coordinate(longitude, "longitude")
+    resolved_level_bounds = _get_explicit_level_bounds(level, bounds=level_bounds)
     return MassIntegrator(
-        delta_p=delta_p(level, bounds=level_bounds),
+        delta_p=delta_p(level, bounds=resolved_level_bounds),
         cell_area=cell_area(
             latitude,
             longitude,
@@ -236,6 +250,7 @@ def build_mass_integrator(
             radius=constants.a,
             latitude_cell_bounds=latitude_cell_bounds,
         ),
+        level_bounds=resolved_level_bounds,
         constants=constants,
     )
 

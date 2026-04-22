@@ -167,3 +167,49 @@ Once the environment is ready, run the live validation path with:
 source .venv/bin/activate
 python -m pytest -m live_seba -rs tests/test_seba_validation.py
 ```
+
+## Mars exact LEC notes
+
+The `mars_exact_lec` exact/topography-aware branch now distinguishes two different objects:
+
+- `Theta` remains the sharp cell-center above-ground mask used for exact-Boer representative fields,
+  validity masks, and derivative-domain masking.
+- `TopographyAwareMeasure` provides the shared finite-volume partial-cell measure used by the
+  exact branch for rigorous diagnostics over uneven topography.
+
+Exact Boer diagnostics now default to the measure-aware finite-volume path. If you pass `ps`,
+the public API auto-constructs a consistent `TopographyAwareMeasure` and uses shared
+partial-cell weights, `p_s_eff`, and measure-aware representative means by default. The
+explicit `measure=` argument is still available as an advanced override when you want to reuse
+an already-constructed measure or control `clip/raise` behavior directly.
+
+```python
+from mars_exact_lec.boer.reservoirs import kinetic_energy_zonal
+from mars_exact_lec.common import build_mass_integrator
+
+integrator = build_mass_integrator(level, latitude, longitude)
+result = kinetic_energy_zonal(u, v, theta, integrator, ps=ps)
+```
+
+If you prefer to build the measure yourself, the exact branch still supports that path:
+
+```python
+from mars_exact_lec.common import TopographyAwareMeasure, build_mass_integrator
+
+integrator = build_mass_integrator(level, latitude, longitude)
+measure = TopographyAwareMeasure.from_surface_pressure(
+    level,
+    ps,
+    integrator,
+    surface_pressure_policy="raise",
+)
+```
+
+If an exact diagnostic does not receive either `ps` or an explicit `measure`, it now raises a
+clear error instead of silently falling back to the old whole-cell mass measure. The default
+`surface_pressure_policy` is `"raise"`; use `"clip"` explicitly when you want to truncate
+columns that extend below the deepest model interface.
+
+Low-level Boer diagnostics continue to return global integrals in `J` and `W`. To compare against
+paper figures reported in `J m-2` or `W m-2`, normalize them explicitly with
+`mars_exact_lec.common.to_per_area()` or `mars_exact_lec.common.normalize_dataset_per_area()`.

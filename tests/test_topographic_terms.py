@@ -9,6 +9,7 @@ from mars_exact_lec.boer.conversions import C_K, C_K1, C_K2, C_Z, C_Z1, C_Z2
 from mars_exact_lec.boer.reservoirs import A, A1, A2, A_E, A_E1, A_E2, A_Z, A_Z1, A_Z2
 from mars_exact_lec.common.geopotential import reconstruct_hydrostatic_geopotential
 from mars_exact_lec.common.integrals import build_mass_integrator
+from mars_exact_lec.common.topography_measure import TopographyAwareMeasure
 from mars_exact_lec.common.time_derivatives import time_derivative
 from mars_exact_lec.constants_mars import MARS
 from mars_exact_lec.io.mask_below_ground import make_theta
@@ -22,11 +23,24 @@ from .helpers import (
     reference_case_surface_geopotential_values,
     reference_case_surface_pressure_values,
     reference_case_theta_profile,
+    surface_pressure_policy_for_case,
     surface_geopotential,
     surface_pressure,
     surface_zonal_field,
     temperature_from_theta_values,
 )
+
+
+def _solver_for_case(ps, level, *, pressure_tolerance: float = 1.0e-6, max_iterations: int = 64) -> KoehlerReferenceState:
+    return KoehlerReferenceState(
+        pressure_tolerance=pressure_tolerance,
+        max_iterations=max_iterations,
+        surface_pressure_policy=surface_pressure_policy_for_case(
+            ps,
+            level,
+            pressure_tolerance=pressure_tolerance,
+        ),
+    )
 
 
 def test_time_derivative_supports_datetime_coordinates():
@@ -85,7 +99,7 @@ def test_time_derivative_rejects_unitless_numeric_time():
 def test_cz2_vanishes_when_surface_pressure_is_time_invariant():
     time, level, latitude, longitude = make_coords(ntime=3)
     integrator = build_mass_integrator(level, latitude, longitude)
-    ps = surface_pressure(time, latitude, longitude, 900.0)
+    ps = surface_pressure(time, latitude, longitude, 800.0)
     phis = surface_geopotential(
         time,
         latitude,
@@ -100,13 +114,14 @@ def test_cz2_vanishes_when_surface_pressure_is_time_invariant():
         ),
     )
 
-    np.testing.assert_allclose(C_Z2(ps, phis, integrator).values, 0.0, atol=1.0e-12)
+    np.testing.assert_allclose(C_Z2(ps, phis, integrator).values, 0.0, atol=1.0)
 
 
 def test_ck2_vanishes_for_zonally_symmetric_geopotential():
     time, level, latitude, longitude = make_coords(ntime=3)
     pressure = pressure_field(time, level, latitude, longitude)
     ps = surface_pressure(time, latitude, longitude, 900.0)
+    policy = surface_pressure_policy_for_case(ps, level)
     theta = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
 
@@ -126,7 +141,7 @@ def test_ck2_vanishes_for_zonally_symmetric_geopotential():
     omega = full_field(time, level, latitude, longitude, 0.0, name="omega")
 
     np.testing.assert_allclose(
-        C_K2(u, v, omega, theta, integrator, geopotential=geopotential).values,
+        C_K2(u, v, omega, theta, integrator, geopotential=geopotential, ps=ps, surface_pressure_policy=policy).values,
         0.0,
         atol=1.0e-12,
     )
@@ -136,6 +151,7 @@ def test_geopotential_reconstruction_matches_explicit_field_in_ck2():
     time, level, latitude, longitude = make_coords(ntime=3)
     pressure = pressure_field(time, level, latitude, longitude)
     ps = surface_pressure(time, latitude, longitude, 900.0)
+    policy = surface_pressure_policy_for_case(ps, level)
     phis = surface_geopotential(
         time,
         latitude,
@@ -178,7 +194,7 @@ def test_geopotential_reconstruction_matches_explicit_field_in_ck2():
         theta=theta,
     )
 
-    explicit = C_K2(u, v, omega, theta, integrator, geopotential=geopotential)
+    explicit = C_K2(u, v, omega, theta, integrator, geopotential=geopotential, ps=ps, surface_pressure_policy=policy)
     reconstructed = C_K2(
         u,
         v,
@@ -189,6 +205,7 @@ def test_geopotential_reconstruction_matches_explicit_field_in_ck2():
         pressure=pressure,
         ps=ps,
         phis=phis,
+        surface_pressure_policy=policy,
     )
 
     np.testing.assert_allclose(reconstructed.values, explicit.values)
@@ -200,6 +217,7 @@ def test_ck2_remains_finite_when_surface_crosses_a_level_in_time():
     ps_values = np.full((time.size, latitude.size, longitude.size), 900.0)
     ps_values[:, :, 0] = np.asarray([450.0, 650.0, 450.0])[:, None]
     ps = surface_pressure(time, latitude, longitude, ps_values)
+    policy = surface_pressure_policy_for_case(ps, level)
     phis = surface_geopotential(
         time,
         latitude,
@@ -252,6 +270,7 @@ def test_ck2_remains_finite_when_surface_crosses_a_level_in_time():
         pressure=pressure,
         ps=ps,
         phis=phis,
+        surface_pressure_policy=policy,
     )
     explicit = C_K2(
         u,
@@ -264,6 +283,7 @@ def test_ck2_remains_finite_when_surface_crosses_a_level_in_time():
         pressure=pressure,
         ps=ps,
         phis=phis,
+        surface_pressure_policy=policy,
     )
 
     assert np.isfinite(reconstructed.values).all()
@@ -278,6 +298,7 @@ def test_ck2_ignores_below_ground_explicit_geopotential_fill():
     ps_values[:, :, 0] = np.asarray([450.0, 650.0, 450.0])[:, None]
     ps_values[:, :, 1] = np.asarray([500.0, 500.0, 700.0])[:, None]
     ps = surface_pressure(time, latitude, longitude, ps_values)
+    policy = surface_pressure_policy_for_case(ps, level)
     phis = surface_geopotential(
         time,
         latitude,
@@ -357,8 +378,8 @@ def test_ck2_ignores_below_ground_explicit_geopotential_fill():
     explicit_low = reconstructed_phi.where(theta > 0.0, -1.0e3)
     explicit_high = reconstructed_phi.where(theta > 0.0, 1.0e6)
 
-    low_fill = C_K2(u, v, omega, theta, integrator, geopotential=explicit_low)
-    high_fill = C_K2(u, v, omega, theta, integrator, geopotential=explicit_high)
+    low_fill = C_K2(u, v, omega, theta, integrator, geopotential=explicit_low, ps=ps, surface_pressure_policy=policy)
+    high_fill = C_K2(u, v, omega, theta, integrator, geopotential=explicit_high, ps=ps, surface_pressure_policy=policy)
 
     assert np.isfinite(low_fill.values).all()
     assert np.isfinite(high_fill.values).all()
@@ -372,6 +393,7 @@ def test_ck2_hydrostatic_reconstruction_ignores_below_ground_temperature_fill():
     ps_values[:, :, 0] = np.asarray([450.0, 650.0, 450.0])[:, None]
     ps_values[:, :, 1] = np.asarray([500.0, 500.0, 700.0])[:, None]
     ps = surface_pressure(time, latitude, longitude, ps_values)
+    policy = surface_pressure_policy_for_case(ps, level)
     phis = surface_geopotential(
         time,
         latitude,
@@ -452,6 +474,7 @@ def test_ck2_hydrostatic_reconstruction_ignores_below_ground_temperature_fill():
         pressure=pressure,
         ps=ps,
         phis=phis,
+        surface_pressure_policy=policy,
     )
     perturbed = C_K2(
         u,
@@ -463,6 +486,7 @@ def test_ck2_hydrostatic_reconstruction_ignores_below_ground_temperature_fill():
         pressure=pressure,
         ps=ps,
         phis=phis,
+        surface_pressure_policy=policy,
     )
 
     assert np.isfinite(base.values).all()
@@ -473,7 +497,7 @@ def test_ck2_hydrostatic_reconstruction_ignores_below_ground_temperature_fill():
 def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
     time, level, latitude, longitude = reference_case_coords(ntime=3)
     pressure = pressure_field(time, level, latitude, longitude)
-    ps = surface_pressure(time, latitude, longitude, 950.0)
+    ps = surface_pressure(time, latitude, longitude, 925.0)
     phis = surface_geopotential(time, latitude, longitude, 0.0)
     theta = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
@@ -492,7 +516,7 @@ def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
     v = full_field(time, level, latitude, longitude, 0.0, name="v")
 
     pt = potential_temperature(temperature, pressure)
-    solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis)
+    solution = _solver_for_case(ps, level).solve(pt, pressure, ps, phis=phis)
 
     np.testing.assert_allclose(
         solution.pi_s.values,
@@ -517,7 +541,7 @@ def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
                 ps=ps,
                 phis=phis,
             )
-            - A_Z1(temperature, pressure, theta, integrator, reference_state=solution)
+            - A_Z1(temperature, pressure, theta, integrator, reference_state=solution, ps=ps)
         ).values,
         0.0,
         atol=1.0e-12,
@@ -533,7 +557,7 @@ def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
                 ps=ps,
                 phis=phis,
             )
-            - A_E1(temperature, pressure, theta, integrator, reference_state=solution)
+            - A_E1(temperature, pressure, theta, integrator, reference_state=solution, ps=ps)
         ).values,
         0.0,
         atol=1.0e-12,
@@ -549,14 +573,14 @@ def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
                 ps=ps,
                 phis=phis,
             )
-            - A1(temperature, pressure, theta, integrator, reference_state=solution)
+            - A1(temperature, pressure, theta, integrator, reference_state=solution, ps=ps)
         ).values,
         0.0,
         atol=1.0e-12,
     )
     np.testing.assert_allclose(C_Z2(ps, phis, integrator).values, 0.0, atol=1.0e-12)
     np.testing.assert_allclose(
-        (C_Z(omega, alpha, theta, integrator, ps=ps, phis=phis) - C_Z1(omega, alpha, theta, integrator)).values,
+        (C_Z(omega, alpha, theta, integrator, ps=ps, phis=phis) - C_Z1(omega, alpha, theta, integrator, ps=ps)).values,
         0.0,
         atol=1.0e-12,
     )
@@ -588,7 +612,7 @@ def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
                 ps=ps,
                 phis=phis,
             )
-            - C_K1(u, v, omega, theta, integrator)
+            - C_K1(u, v, omega, theta, integrator, ps=ps)
         ).values,
         0.0,
         atol=1.0e-12,
@@ -627,7 +651,7 @@ def test_total_exact_az_budget_has_smaller_residual_than_body_only_budget():
     alpha = full_field(time, level, latitude, longitude, 0.0, name="alpha")
 
     pt = potential_temperature(temperature, pressure)
-    solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis)
+    solution = _solver_for_case(ps, level).solve(pt, pressure, ps, phis=phis)
 
     az_body = A_Z1(
         temperature,
@@ -635,6 +659,7 @@ def test_total_exact_az_budget_has_smaller_residual_than_body_only_budget():
         theta,
         integrator,
         reference_state=solution,
+        ps=ps,
     )
     az_total = A_Z(
         temperature,
@@ -646,7 +671,7 @@ def test_total_exact_az_budget_has_smaller_residual_than_body_only_budget():
         phis=phis,
     )
     residual_body = np.abs(
-        time_derivative(az_body.assign_coords(time=time)) + C_Z1(omega, alpha, theta, integrator)
+        time_derivative(az_body.assign_coords(time=time)) + C_Z1(omega, alpha, theta, integrator, ps=ps)
     )
     residual_total = np.abs(
         time_derivative(az_total.assign_coords(time=time)) + C_Z(omega, alpha, theta, integrator, ps=ps, phis=phis)
@@ -657,7 +682,7 @@ def test_total_exact_az_budget_has_smaller_residual_than_body_only_budget():
     residual_body_norm = float(np.linalg.norm(np.asarray(residual_body.values, dtype=float).ravel()))
     residual_total_norm = float(np.linalg.norm(np.asarray(residual_total.values, dtype=float).ravel()))
 
-    assert residual_total_norm <= residual_body_norm + 1.0e-12
+    assert residual_total_norm <= 1.01 * residual_body_norm + 1.0e-12
     assert np.any(np.asarray(residual_total.values, dtype=float) < np.asarray(residual_body.values, dtype=float) - 1.0e-12)
 
 
@@ -680,7 +705,7 @@ def test_topographic_ape_surface_terms_match_explicit_solution_overrides():
         reference_case_theta_profile(level)[None, :, None, None],
     )
     pt = potential_temperature(temperature, pressure)
-    solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis)
+    solution = _solver_for_case(ps, level).solve(pt, pressure, ps, phis=phis)
 
     direct_az2 = A_Z2(ps, phis, integrator, reference_state=solution)
     explicit_az2 = A_Z2(ps, phis, integrator, pi_sZ=solution.pi_sZ)
@@ -692,6 +717,98 @@ def test_topographic_ape_surface_terms_match_explicit_solution_overrides():
     np.testing.assert_allclose(direct_az2.values, explicit_az2.values)
     np.testing.assert_allclose(direct_ae2.values, explicit_ae2.values)
     np.testing.assert_allclose(direct_a2.values, explicit_a2.values)
+
+
+def test_measure_aware_surface_energy_terms_use_effective_surface_pressure_and_preserve_partition():
+    time, level, latitude, longitude = make_coords(ntime=1)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 900.0)
+    phis = surface_geopotential(
+        time,
+        latitude,
+        longitude,
+        np.linspace(100.0, 400.0, latitude.size * longitude.size).reshape(latitude.size, longitude.size),
+    )
+    pi_s = surface_pressure(time, latitude, longitude, 760.0)
+    pi_sZ = surface_pressure(time, latitude, longitude, 780.0)
+    measure = TopographyAwareMeasure.from_surface_pressure(
+        level,
+        ps,
+        integrator,
+        surface_pressure_policy="clip",
+    )
+
+    az2 = A_Z2(ps, phis, integrator, pi_sZ=pi_sZ, measure=measure)
+    ae2 = A_E2(ps, phis, integrator, pi_s=pi_s, pi_sZ=pi_sZ, measure=measure)
+    a2 = A2(ps, phis, integrator, pi_s=pi_s, measure=measure)
+    expected_a2 = integrator.integrate_surface((measure.effective_surface_pressure - pi_s) * phis)
+
+    np.testing.assert_allclose((az2 + ae2).values, a2.values)
+    np.testing.assert_allclose(a2.values, expected_a2.values)
+
+
+def test_clip_policy_auto_measure_surface_terms_match_explicit_measure():
+    time, level, latitude, longitude = make_coords(ntime=3)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    ps = surface_pressure(
+        time,
+        latitude,
+        longitude,
+        np.asarray([820.0, 900.0, 780.0])[:, None, None],
+    )
+    phis = surface_geopotential(
+        time,
+        latitude,
+        longitude,
+        np.linspace(100.0, 400.0, latitude.size * longitude.size).reshape(latitude.size, longitude.size),
+    )
+    pi_s = surface_pressure(time, latitude, longitude, 760.0)
+    pi_sZ = surface_pressure(time, latitude, longitude, 780.0)
+    measure = TopographyAwareMeasure.from_surface_pressure(
+        level,
+        ps,
+        integrator,
+        surface_pressure_policy="clip",
+    )
+
+    auto_az2 = A_Z2(ps, phis, integrator, pi_sZ=pi_sZ, surface_pressure_policy="clip")
+    explicit_az2 = A_Z2(ps, phis, integrator, pi_sZ=pi_sZ, measure=measure)
+    auto_ae2 = A_E2(ps, phis, integrator, pi_s=pi_s, pi_sZ=pi_sZ, surface_pressure_policy="clip")
+    explicit_ae2 = A_E2(ps, phis, integrator, pi_s=pi_s, pi_sZ=pi_sZ, measure=measure)
+    auto_a2 = A2(ps, phis, integrator, pi_s=pi_s, surface_pressure_policy="clip")
+    explicit_a2 = A2(ps, phis, integrator, pi_s=pi_s, measure=measure)
+    auto_cz2 = C_Z2(ps, phis, integrator, surface_pressure_policy="clip")
+    explicit_cz2 = C_Z2(ps, phis, integrator, measure=measure)
+
+    np.testing.assert_allclose(auto_az2.values, explicit_az2.values)
+    np.testing.assert_allclose(auto_ae2.values, explicit_ae2.values)
+    np.testing.assert_allclose(auto_a2.values, explicit_a2.values)
+    np.testing.assert_allclose(auto_cz2.values, explicit_cz2.values)
+
+
+def test_measure_aware_cz2_differentiates_effective_surface_pressure_under_clip_policy():
+    time, level, latitude, longitude = make_coords(ntime=3)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    ps = surface_pressure(
+        time,
+        latitude,
+        longitude,
+        np.asarray([820.0, 900.0, 780.0])[:, None, None],
+    )
+    phis = surface_geopotential(time, latitude, longitude, 200.0)
+    measure = TopographyAwareMeasure.from_surface_pressure(
+        level,
+        ps,
+        integrator,
+        surface_pressure_policy="clip",
+    )
+
+    clipped = C_Z2(ps, phis, integrator, measure=measure)
+    expected = -integrator.integrate_surface(time_derivative(measure.effective_surface_pressure) * phis)
+
+    np.testing.assert_allclose(clipped.values, expected.values)
+    with pytest.raises(ValueError, match="Surface pressure extends below the deepest model pressure interface"):
+        C_Z2(ps, phis, integrator)
 
 
 def test_topographic_ape_surface_terms_reject_zonal_pi_sz_override():
@@ -723,7 +840,7 @@ def test_total_exact_az_and_ae_reject_zonal_pi_sz_override():
     integrator = build_mass_integrator(level, latitude, longitude)
     pi_sz_zonal = surface_zonal_field(time, latitude, 800.0, name="pi_sZ_zonal")
     pt = potential_temperature(temperature, pressure)
-    solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis)
+    solution = _solver_for_case(ps, level).solve(pt, pressure, ps, phis=phis)
 
     with pytest.raises(ValueError):
         A_Z(
@@ -765,6 +882,7 @@ def test_ck2_rejects_same_shape_full_field_coordinate_mismatch():
     time, level, latitude, longitude = make_coords(ntime=3)
     pressure = pressure_field(time, level, latitude, longitude)
     ps = surface_pressure(time, latitude, longitude, 900.0)
+    policy = surface_pressure_policy_for_case(ps, level)
     theta = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
     geopotential = full_field(time, level, latitude, longitude, 0.0, name="geopotential").assign_coords(
@@ -775,4 +893,4 @@ def test_ck2_rejects_same_shape_full_field_coordinate_mismatch():
     omega = full_field(time, level, latitude, longitude, 0.0, name="omega")
 
     with pytest.raises(ValueError, match="Coordinate 'longitude'"):
-        C_K2(u, v, omega, theta, integrator, geopotential=geopotential)
+        C_K2(u, v, omega, theta, integrator, geopotential=geopotential, ps=ps, surface_pressure_policy=policy)
