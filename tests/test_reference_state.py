@@ -24,7 +24,9 @@ from .helpers import (
     reference_case_coords,
     reference_case_surface_geopotential_values,
     reference_case_surface_pressure_values,
+    reference_case_surface_time_series,
     reference_case_terrain_anomaly_values,
+    reference_case_theta_field_values,
     reference_case_theta_profile,
     surface_mass_from_pi_s,
     surface_geopotential,
@@ -831,6 +833,80 @@ def _build_asymmetric_reference_case(*, grid: str = "regular", ntime: int = 2, l
         "pt": pt,
         "solution": solution,
     }
+
+
+def test_reference_state_fast_stress_sentinel_remains_converged_finite_and_closed():
+    time, level, latitude, longitude = reference_case_coords(ntime=3)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps_2d = reference_case_surface_pressure_values(
+        latitude,
+        longitude,
+        base=930.0,
+        lon_drop=560.0,
+        lat_drop=140.0,
+    )
+    ps = surface_pressure(
+        time,
+        latitude,
+        longitude,
+        reference_case_surface_time_series(ps_2d, [20.0, -40.0, 60.0]),
+    )
+    phis = surface_geopotential(
+        time,
+        latitude,
+        longitude,
+        reference_case_surface_geopotential_values(
+            latitude,
+            longitude,
+            lat_range=900.0,
+            lon_range=1400.0,
+        ),
+    )
+    theta_mask = make_theta(pressure, ps)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    theta_values = reference_case_theta_field_values(
+        time,
+        level,
+        latitude,
+        longitude,
+        base=175.0,
+        step=5.0,
+        time_offsets=[20.0, -40.0, 60.0],
+        lat_amplitude=8.0,
+        lon_amplitude=12.0,
+    )
+    temperature = temperature_from_theta_values(time, level, latitude, longitude, theta_values)
+    pt = potential_temperature(temperature, pressure)
+    solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis)
+    pi = solution.reference_pressure(pt, pressure=pressure)
+    n = solution.efficiency(pt, pressure)
+
+    assert solution.converged is not None
+    assert solution.converged_zonal is not None
+    assert solution.converged.values.all()
+    assert solution.converged_zonal.values.all()
+    assert np.isfinite(pi.values).all()
+    assert np.isfinite(n.values).all()
+    assert np.isfinite(solution.pi_s.values).all()
+    assert np.isfinite(solution.pi_sZ.values).all()
+
+    np.testing.assert_allclose(
+        surface_mass_from_pi_s(
+            solution.pi_s,
+            solution.reference_top_pressure,
+            integrator.cell_area,
+        ).values,
+        solution.total_mass.values,
+        rtol=20.0 * KoehlerReferenceState().pressure_tolerance,
+        atol=0.0,
+    )
+
+    for time_index in range(time.size):
+        profile = finite_reference_profile(solution, time_index=time_index)
+        assert np.all(np.diff(profile["theta_reference"]) > 0.0)
+        assert np.all(np.diff(profile["pi_reference"]) < 0.0)
+        assert np.all(np.diff(profile["reference_interface_pressure"]) < 0.0)
+        assert np.all(np.diff(profile["reference_interface_geopotential"]) > 0.0)
 
 
 def test_reference_state_default_phis_none_matches_zero_topography():

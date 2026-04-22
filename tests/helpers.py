@@ -141,6 +141,35 @@ def reference_case_theta_profile(level, *, base: float = 180.0, step: float = 5.
     return base + step * np.arange(level.size, dtype=float)
 
 
+def reference_case_theta_field_values(
+    time,
+    level,
+    latitude,
+    longitude,
+    *,
+    base: float,
+    step: float,
+    time_offsets,
+    lat_amplitude: float,
+    lon_amplitude: float,
+) -> np.ndarray:
+    time_offsets = np.asarray(time_offsets, dtype=float)
+    if time_offsets.ndim == 0:
+        time_offsets = np.full(time.size, float(time_offsets))
+    if time_offsets.shape != (time.size,):
+        raise ValueError("time_offsets must be scalar or have shape (time,).")
+
+    base_profile = reference_case_theta_profile(level, base=base, step=step)[None, :, None, None]
+    centered_latitude = np.linspace(-1.0, 1.0, latitude.size, dtype=float)[None, None, :, None]
+    centered_longitude = np.linspace(-1.0, 1.0, longitude.size, dtype=float)[None, None, None, :]
+    return (
+        base_profile
+        + time_offsets[:, None, None, None]
+        + float(lat_amplitude) * centered_latitude
+        + float(lon_amplitude) * centered_longitude
+    )
+
+
 def reference_case_surface_pressure_values(
     latitude,
     longitude,
@@ -173,6 +202,19 @@ def reference_case_terrain_anomaly_values(latitude, longitude, amplitude: float)
     pattern = lon_centered + 0.35 * lat_centered
     pattern = pattern / np.max(np.abs(pattern))
     return amplitude * pattern
+
+
+def reference_case_surface_time_series(surface_2d, time_offsets) -> np.ndarray:
+    surface_2d = np.asarray(surface_2d, dtype=float)
+    if surface_2d.ndim != 2:
+        raise ValueError("surface_2d must be two-dimensional.")
+
+    time_offsets = np.asarray(time_offsets, dtype=float)
+    if time_offsets.ndim == 0:
+        time_offsets = np.asarray([float(time_offsets)], dtype=float)
+    if time_offsets.ndim != 1:
+        raise ValueError("time_offsets must be scalar or one-dimensional.")
+    return surface_2d[None, :, :] + time_offsets[:, None, None]
 
 
 def reference_case_level_bounds(level) -> xr.DataArray:
