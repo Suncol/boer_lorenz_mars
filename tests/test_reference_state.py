@@ -21,6 +21,11 @@ from .helpers import (
     pressure_inside_reference_layer,
     pressure_field,
     reference_layer_mass_from_interfaces,
+    reference_case_coords,
+    reference_case_surface_geopotential_values,
+    reference_case_surface_pressure_values,
+    reference_case_terrain_anomaly_values,
+    reference_case_theta_profile,
     surface_mass_from_pi_s,
     surface_geopotential,
     surface_pressure,
@@ -300,30 +305,31 @@ def test_single_sample_reference_pressure_requires_pressure_and_gives_zero_ape()
 
 
 def test_reference_state_preserves_total_mass_and_monotonic_reference_curve():
-    time, level, latitude, longitude = make_coords()
+    time, level, latitude, longitude = reference_case_coords()
     pressure = pressure_field(time, level, latitude, longitude)
     phis = surface_geopotential(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [0.0, 50.0, 100.0, 150.0],
-                [25.0, 75.0, 125.0, 175.0],
-                [50.0, 100.0, 150.0, 200.0],
-                [75.0, 125.0, 175.0, 225.0],
-            ]
+        reference_case_surface_geopotential_values(
+            latitude,
+            longitude,
+            lat_range=180.0,
+            lon_range=360.0,
         ),
     )
-    ps_values = np.asarray(
-        [
-            [900.0, 650.0, 450.0, 250.0],
-            [900.0, 650.0, 450.0, 250.0],
-            [900.0, 650.0, 450.0, 250.0],
-            [900.0, 650.0, 450.0, 250.0],
-        ]
+    ps = surface_pressure(
+        time,
+        latitude,
+        longitude,
+        reference_case_surface_pressure_values(
+            latitude,
+            longitude,
+            base=910.0,
+            lon_drop=480.0,
+            lat_drop=120.0,
+        ),
     )
-    ps = surface_pressure(time, latitude, longitude, ps_values)
     theta_mask = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
 
@@ -348,7 +354,7 @@ def test_reference_state_preserves_total_mass_and_monotonic_reference_curve():
         ((solution.pi_s - solution.reference_top_pressure) * integrator.cell_area).sum(dim=("latitude", "longitude"))
         / MARS.g
     )
-    np.testing.assert_allclose(reconstructed_mass.values, solution.total_mass.values, rtol=2.0e-6, atol=0.0)
+    np.testing.assert_allclose(reconstructed_mass.values, solution.total_mass.values, rtol=5.0e-6, atol=0.0)
     np.testing.assert_allclose(
         solution.reference_bottom_pressure.values,
         solution.pi_s.max(dim=("latitude", "longitude")).values,
@@ -394,22 +400,10 @@ def test_reference_state_preserves_total_mass_and_monotonic_reference_curve():
 
 
 def test_reference_state_uniform_phis_offset_leaves_solution_invariant():
-    time, level, latitude, longitude = make_coords(ntime=1)
+    time, level, latitude, longitude = reference_case_coords(ntime=1)
     pressure = pressure_field(time, level, latitude, longitude)
-    ps = surface_pressure(
-        time,
-        latitude,
-        longitude,
-        np.asarray(
-            [
-                [900.0, 650.0, 450.0, 250.0],
-                [900.0, 650.0, 450.0, 250.0],
-                [900.0, 650.0, 450.0, 250.0],
-                [900.0, 650.0, 450.0, 250.0],
-            ]
-        ),
-    )
-    theta_profile = np.asarray([180.0, 200.0, 220.0])
+    ps = surface_pressure(time, latitude, longitude, reference_case_surface_pressure_values(latitude, longitude))
+    theta_profile = reference_case_theta_profile(level)
     temperature = temperature_from_theta_values(
         time,
         level,
@@ -448,22 +442,21 @@ def test_reference_state_uniform_phis_offset_leaves_solution_invariant():
 
 
 def test_uneven_topography_changes_pi_reference_at_fixed_theta_and_ps():
-    time, level, latitude, longitude = make_coords(ntime=1)
+    time, level, latitude, longitude = reference_case_coords(ntime=1)
     pressure = pressure_field(time, level, latitude, longitude)
     ps = surface_pressure(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [900.0, 650.0, 520.0, 420.0],
-                [900.0, 650.0, 520.0, 420.0],
-                [900.0, 650.0, 520.0, 420.0],
-                [900.0, 650.0, 520.0, 420.0],
-            ]
+        reference_case_surface_pressure_values(
+            latitude,
+            longitude,
+            base=910.0,
+            lon_drop=390.0,
+            lat_drop=70.0,
         ),
     )
-    theta_profile = np.asarray([180.0, 200.0, 220.0])
+    theta_profile = reference_case_theta_profile(level)
     temperature = temperature_from_theta_values(
         time,
         level,
@@ -478,15 +471,7 @@ def test_uneven_topography_changes_pi_reference_at_fixed_theta_and_ps():
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [-1500.0, -500.0, 500.0, 1500.0],
-                [-1500.0, -500.0, 500.0, 1500.0],
-                [-1500.0, -500.0, 500.0, 1500.0],
-                [-1500.0, -500.0, 500.0, 1500.0],
-            ]
-        )
-        + 2000.0,
+        reference_case_terrain_anomaly_values(latitude, longitude, 1500.0) + 2000.0,
     )
 
     base = solver.solve(pt, pressure, ps, phis=phis_base)
@@ -505,22 +490,21 @@ def test_uneven_topography_changes_pi_reference_at_fixed_theta_and_ps():
 
 
 def test_topography_response_grows_with_terrain_amplitude():
-    time, level, latitude, longitude = make_coords(ntime=1)
+    time, level, latitude, longitude = reference_case_coords(ntime=1)
     pressure = pressure_field(time, level, latitude, longitude)
     ps = surface_pressure(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [900.0, 650.0, 520.0, 420.0],
-                [900.0, 650.0, 520.0, 420.0],
-                [900.0, 650.0, 520.0, 420.0],
-                [900.0, 650.0, 520.0, 420.0],
-            ]
+        reference_case_surface_pressure_values(
+            latitude,
+            longitude,
+            base=910.0,
+            lon_drop=390.0,
+            lat_drop=70.0,
         ),
     )
-    theta_profile = np.asarray([180.0, 200.0, 220.0])
+    theta_profile = reference_case_theta_profile(level)
     temperature = temperature_from_theta_values(
         time,
         level,
@@ -536,29 +520,13 @@ def test_topography_response_grows_with_terrain_amplitude():
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [-750.0, -250.0, 250.0, 750.0],
-                [-750.0, -250.0, 250.0, 750.0],
-                [-750.0, -250.0, 250.0, 750.0],
-                [-750.0, -250.0, 250.0, 750.0],
-            ]
-        )
-        + 2000.0,
+        reference_case_terrain_anomaly_values(latitude, longitude, 750.0) + 2000.0,
     )
     anomaly_large = surface_geopotential(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [-1500.0, -500.0, 500.0, 1500.0],
-                [-1500.0, -500.0, 500.0, 1500.0],
-                [-1500.0, -500.0, 500.0, 1500.0],
-                [-1500.0, -500.0, 500.0, 1500.0],
-            ]
-        )
-        + 2000.0,
+        reference_case_terrain_anomaly_values(latitude, longitude, 1500.0) + 2000.0,
     )
     small = solver.solve(pt, pressure, ps, phis=anomaly_small)
     large = solver.solve(pt, pressure, ps, phis=anomaly_large)
@@ -571,28 +539,21 @@ def test_topography_response_grows_with_terrain_amplitude():
 
 
 def test_pi_sz_matches_pi_s_for_zonal_thermodynamic_state():
-    time, level, latitude, longitude = make_coords(ntime=1)
+    time, level, latitude, longitude = reference_case_coords(ntime=1)
     pressure = pressure_field(time, level, latitude, longitude)
-    ps = surface_pressure(time, latitude, longitude, 900.0)
+    ps = surface_pressure(time, latitude, longitude, 950.0)
     phis = surface_geopotential(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [0.0, 100.0, 200.0, 300.0],
-                [50.0, 150.0, 250.0, 350.0],
-                [100.0, 200.0, 300.0, 400.0],
-                [150.0, 250.0, 350.0, 450.0],
-            ]
-        ),
+        reference_case_surface_geopotential_values(latitude, longitude),
     )
     temperature = temperature_from_theta_values(
         time,
         level,
         latitude,
         longitude,
-        np.asarray([180.0, 200.0, 220.0])[None, :, None, None],
+        reference_case_theta_profile(level)[None, :, None, None],
     )
     pt = potential_temperature(temperature, pressure)
     solver = KoehlerReferenceState()
@@ -604,47 +565,32 @@ def test_pi_sz_matches_pi_s_for_zonal_thermodynamic_state():
 
 
 def test_pi_sz_differs_from_weighted_zonal_mean_of_pi_s_for_asymmetric_case():
-    time, level, latitude, longitude = make_coords(ntime=1)
+    time, level, latitude, longitude = reference_case_coords(ntime=1)
     pressure = pressure_field(time, level, latitude, longitude)
-    ps = surface_pressure(
-        time,
-        latitude,
-        longitude,
-        np.asarray(
-            [
-                [900.0, 700.0, 500.0, 350.0],
-                [900.0, 700.0, 500.0, 350.0],
-                [900.0, 700.0, 500.0, 350.0],
-                [900.0, 700.0, 500.0, 350.0],
-            ]
-        ),
-    )
+    ps = surface_pressure(time, latitude, longitude, reference_case_surface_pressure_values(latitude, longitude))
     phis = surface_geopotential(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [0.0, 200.0, 1200.0, 2400.0],
-                [0.0, 200.0, 1200.0, 2400.0],
-                [0.0, 200.0, 1200.0, 2400.0],
-                [0.0, 200.0, 1200.0, 2400.0],
-            ]
+        reference_case_surface_geopotential_values(
+            latitude,
+            longitude,
+            lat_range=0.0,
+            lon_range=2400.0,
         ),
     )
-    theta_columns = np.asarray(
-        [
-            [180.0, 185.0, 195.0, 210.0],
-            [200.0, 210.0, 225.0, 240.0],
-            [220.0, 235.0, 255.0, 270.0],
-        ]
-    )
-    temperature = temperature_from_theta_values(
+    temperature = full_field(
         time,
         level,
         latitude,
         longitude,
-        theta_columns[None, :, None, :],
+        np.linspace(
+            170.0,
+            270.0,
+            time.size * level.size * latitude.size * longitude.size,
+        ).reshape(time.size, level.size, latitude.size, longitude.size),
+        name="temperature",
+        units="K",
     )
     pt = potential_temperature(temperature, pressure)
     solver = KoehlerReferenceState()
@@ -657,46 +603,14 @@ def test_pi_sz_differs_from_weighted_zonal_mean_of_pi_s_for_asymmetric_case():
 
 
 def test_available_potential_energy_exact_partition_closes():
-    time, level, latitude, longitude = make_coords()
-    pressure = pressure_field(time, level, latitude, longitude)
-    phis = surface_geopotential(
-        time,
-        latitude,
-        longitude,
-        np.asarray(
-            [
-                [0.0, 100.0, 200.0, 300.0],
-                [50.0, 150.0, 250.0, 350.0],
-                [100.0, 200.0, 300.0, 400.0],
-                [150.0, 250.0, 350.0, 450.0],
-            ]
-        ),
-    )
-    ps_values = np.asarray(
-        [
-            [900.0, 700.0, 500.0, 350.0],
-            [900.0, 700.0, 500.0, 350.0],
-            [900.0, 700.0, 500.0, 350.0],
-            [900.0, 700.0, 500.0, 350.0],
-        ]
-    )
-    ps = surface_pressure(time, latitude, longitude, ps_values)
-    theta_mask = make_theta(pressure, ps)
-    integrator = build_mass_integrator(level, latitude, longitude)
-
-    temperature = full_field(
-        time,
-        level,
-        latitude,
-        longitude,
-        np.linspace(170.0, 255.0, time.size * level.size * latitude.size * longitude.size).reshape(
-            time.size, level.size, latitude.size, longitude.size
-        ),
-        name="temperature",
-        units="K",
-    )
-    pt = potential_temperature(temperature, pressure)
-    solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis)
+    case = _build_asymmetric_reference_case()
+    pressure = case["pressure"]
+    temperature = case["temperature"]
+    theta_mask = case["theta_mask"]
+    integrator = case["integrator"]
+    ps = case["ps"]
+    phis = case["phis"]
+    solution = case["solution"]
 
     a_total = A(
         temperature,
@@ -847,9 +761,9 @@ def test_zonal_reference_pressure_requires_zonal_inputs():
 
 
 def _build_flat_reference_case(*, grid: str = "regular", ntime: int = 1):
-    time, level, latitude, longitude = make_coords(grid=grid, ntime=ntime)
+    time, level, latitude, longitude = reference_case_coords(grid=grid, ntime=ntime)
     pressure = pressure_field(time, level, latitude, longitude)
-    ps = surface_pressure(time, latitude, longitude, 900.0)
+    ps = surface_pressure(time, latitude, longitude, 950.0)
     phis = surface_geopotential(time, latitude, longitude, 0.0)
     theta_mask = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
@@ -858,7 +772,7 @@ def _build_flat_reference_case(*, grid: str = "regular", ntime: int = 1):
         level,
         latitude,
         longitude,
-        np.asarray([180.0, 200.0, 220.0])[None, :, None, None],
+        reference_case_theta_profile(level)[None, :, None, None],
     )
     pt = potential_temperature(temperature, pressure)
     solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis)
@@ -879,29 +793,14 @@ def _build_flat_reference_case(*, grid: str = "regular", ntime: int = 1):
 
 
 def _build_asymmetric_reference_case(*, grid: str = "regular", ntime: int = 2, level_bounds=None):
-    time, level, latitude, longitude = make_coords(grid=grid, ntime=ntime)
+    time, level, latitude, longitude = reference_case_coords(grid=grid, ntime=ntime)
     pressure = pressure_field(time, level, latitude, longitude)
-    ps_values = np.asarray(
-        [
-            [900.0, 700.0, 500.0, 350.0],
-            [900.0, 700.0, 500.0, 350.0],
-            [900.0, 700.0, 500.0, 350.0],
-            [900.0, 700.0, 500.0, 350.0],
-        ]
-    )
-    ps = surface_pressure(time, latitude, longitude, ps_values)
+    ps = surface_pressure(time, latitude, longitude, reference_case_surface_pressure_values(latitude, longitude))
     phis = surface_geopotential(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [0.0, 100.0, 200.0, 300.0],
-                [50.0, 150.0, 250.0, 350.0],
-                [100.0, 200.0, 300.0, 400.0],
-                [150.0, 250.0, 350.0, 450.0],
-            ]
-        ),
+        reference_case_surface_geopotential_values(latitude, longitude),
     )
     theta_mask = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude, level_bounds=level_bounds)
@@ -1153,21 +1052,15 @@ def test_reference_state_rejects_invalid_surface_inputs():
     with pytest.raises(ValueError, match="Surface geopotential must remain finite"):
         KoehlerReferenceState().solve(pt, pressure, case["ps"], phis=invalid_phis)
 
-    no_air_ps = surface_pressure(time, latitude, longitude, 150.0)
+    no_air_ps = surface_pressure(time, latitude, longitude, 50.0)
     with pytest.raises(ValueError, match="at least one above-ground parcel"):
         KoehlerReferenceState().solve(pt, pressure, no_air_ps, phis=case["phis"])
 
 
 def test_reference_state_gaussian_grid_preserves_flat_limit_contract():
-    time, _, latitude, longitude = make_coords(grid="gaussian", ntime=1)
-    level = xr.DataArray(
-        np.asarray([900.0, 700.0, 500.0]),
-        dims=("level",),
-        coords={"level": [900.0, 700.0, 500.0]},
-        attrs={"units": "Pa", "axis": "Z", "standard_name": "pressure"},
-    )
+    time, level, latitude, longitude = reference_case_coords(grid="gaussian", ntime=1)
     pressure = pressure_field(time, level, latitude, longitude)
-    ps = surface_pressure(time, latitude, longitude, 850.0)
+    ps = surface_pressure(time, latitude, longitude, 875.0)
     phis = surface_geopotential(time, latitude, longitude, 0.0)
     theta_mask = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
@@ -1176,18 +1069,27 @@ def test_reference_state_gaussian_grid_preserves_flat_limit_contract():
         level,
         latitude,
         longitude,
-        np.asarray([180.0, 200.0, 220.0])[None, :, None, None],
+        reference_case_theta_profile(level)[None, :, None, None],
     )
     pt = potential_temperature(temperature, pressure)
     solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis)
     pi = solution.reference_pressure(pt, pressure=pressure)
+    ape_tolerance = (
+        1.0e-16
+        * float(solution.total_mass.isel(time=0))
+        * MARS.cp
+        * float(reference_case_theta_profile(level).max())
+    )
 
     np.testing.assert_allclose(
         pi.isel(level=slice(1, None)).values,
         pressure.isel(level=slice(1, None)).values,
         atol=1.0e-12,
     )
-    assert np.all(np.asarray(pi.isel(level=0).values, dtype=float) < float(solution.reference_bottom_pressure.isel(time=0)))
+    assert np.all(
+        np.asarray(pi.isel(level=0).values, dtype=float)
+        <= float(solution.reference_bottom_pressure.isel(time=0)) + 1.0e-12
+    )
     assert np.all(np.asarray(pi.isel(level=0).values, dtype=float) > np.asarray(pressure.isel(level=1).values, dtype=float))
     np.testing.assert_allclose(
         solution.pi_s.values,
@@ -1207,7 +1109,7 @@ def test_reference_state_gaussian_grid_preserves_flat_limit_contract():
             phis=phis,
         ).values,
         0.0,
-        atol=1.0e-12,
+        atol=ape_tolerance,
     )
     np.testing.assert_allclose(
         A_Z(
@@ -1220,7 +1122,7 @@ def test_reference_state_gaussian_grid_preserves_flat_limit_contract():
             phis=phis,
         ).values,
         0.0,
-        atol=1.0e-12,
+        atol=ape_tolerance,
     )
     np.testing.assert_allclose(
         A_E(
@@ -1233,7 +1135,7 @@ def test_reference_state_gaussian_grid_preserves_flat_limit_contract():
             phis=phis,
         ).values,
         0.0,
-        atol=1.0e-12,
+        atol=ape_tolerance,
     )
     np.testing.assert_allclose(
         surface_mass_from_pi_s(

@@ -18,6 +18,10 @@ from .helpers import (
     full_field,
     make_coords,
     pressure_field,
+    reference_case_coords,
+    reference_case_surface_geopotential_values,
+    reference_case_surface_pressure_values,
+    reference_case_theta_profile,
     surface_geopotential,
     surface_pressure,
     surface_zonal_field,
@@ -467,9 +471,9 @@ def test_ck2_hydrostatic_reconstruction_ignores_below_ground_temperature_fill():
 
 
 def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
-    time, level, latitude, longitude = make_coords(ntime=3)
+    time, level, latitude, longitude = reference_case_coords(ntime=3)
     pressure = pressure_field(time, level, latitude, longitude)
-    ps = surface_pressure(time, latitude, longitude, 900.0)
+    ps = surface_pressure(time, latitude, longitude, 950.0)
     phis = surface_geopotential(time, latitude, longitude, 0.0)
     theta = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
@@ -479,7 +483,7 @@ def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
         level,
         latitude,
         longitude,
-        (210.0 / (level.values / MARS.p00) ** MARS.kappa)[None, :, None, None],
+        reference_case_theta_profile(level, base=190.0, step=4.0)[None, :, None, None],
         name="temperature",
     )
     omega = full_field(time, level, latitude, longitude, np.linspace(-0.3, 0.3, time.size)[:, None, None, None], name="omega")
@@ -592,27 +596,19 @@ def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
 
 
 def test_total_exact_az_budget_has_smaller_residual_than_body_only_budget():
-    time, level, latitude, longitude = make_coords(ntime=3)
+    time, level, latitude, longitude = reference_case_coords(ntime=3)
     pressure = pressure_field(time, level, latitude, longitude)
     ps = surface_pressure(
         time,
         latitude,
         longitude,
-        np.asarray([850.0, 900.0, 950.0])[:, None, None],
+        np.asarray([880.0, 900.0, 920.0])[:, None, None],
     )
     phis = surface_geopotential(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [0.0, 100.0, 200.0, 300.0],
-                [50.0, 150.0, 250.0, 350.0],
-                [100.0, 200.0, 300.0, 400.0],
-                [150.0, 250.0, 350.0, 450.0],
-            ]
-        )
-        * 0.1,
+        0.1 * reference_case_surface_geopotential_values(latitude, longitude),
     )
     theta = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
@@ -622,7 +618,10 @@ def test_total_exact_az_budget_has_smaller_residual_than_body_only_budget():
         level,
         latitude,
         longitude,
-        (np.asarray([180.0, 200.0, 220.0])[None, :, None, None] + np.asarray([0.0, 2.0, 4.0])[:, None, None, None]),
+        (
+            reference_case_theta_profile(level)[None, :, None, None]
+            + np.asarray([0.0, 2.0, 4.0])[:, None, None, None]
+        ),
     )
     omega = full_field(time, level, latitude, longitude, 0.0, name="omega")
     alpha = full_field(time, level, latitude, longitude, 0.0, name="alpha")
@@ -663,33 +662,14 @@ def test_total_exact_az_budget_has_smaller_residual_than_body_only_budget():
 
 
 def test_topographic_ape_surface_terms_match_explicit_solution_overrides():
-    time, level, latitude, longitude = make_coords(ntime=1)
+    time, level, latitude, longitude = reference_case_coords(ntime=1)
     pressure = pressure_field(time, level, latitude, longitude)
-    ps = surface_pressure(
-        time,
-        latitude,
-        longitude,
-        np.asarray(
-            [
-                [900.0, 700.0, 500.0, 350.0],
-                [900.0, 700.0, 500.0, 350.0],
-                [900.0, 700.0, 500.0, 350.0],
-                [900.0, 700.0, 500.0, 350.0],
-            ]
-        ),
-    )
+    ps = surface_pressure(time, latitude, longitude, reference_case_surface_pressure_values(latitude, longitude))
     phis = surface_geopotential(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [0.0, 100.0, 200.0, 300.0],
-                [50.0, 150.0, 250.0, 350.0],
-                [100.0, 200.0, 300.0, 400.0],
-                [150.0, 250.0, 350.0, 450.0],
-            ]
-        ),
+        reference_case_surface_geopotential_values(latitude, longitude),
     )
     integrator = build_mass_integrator(level, latitude, longitude)
     temperature = temperature_from_theta_values(
@@ -697,7 +677,7 @@ def test_topographic_ape_surface_terms_match_explicit_solution_overrides():
         level,
         latitude,
         longitude,
-        np.asarray([180.0, 200.0, 220.0])[None, :, None, None],
+        reference_case_theta_profile(level)[None, :, None, None],
     )
     pt = potential_temperature(temperature, pressure)
     solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis)

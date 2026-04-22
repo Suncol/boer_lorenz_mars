@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 np = pytest.importorskip("numpy")
-xr = pytest.importorskip("xarray")
 
 from mars_exact_lec.common.integrals import build_mass_integrator
 from mars_exact_lec.constants_mars import MARS
@@ -11,9 +10,13 @@ from mars_exact_lec.reference_state import KoehlerReferenceState, potential_temp
 
 from .helpers import (
     finite_reference_profile,
-    full_field,
-    make_coords,
     pressure_field,
+    reference_case_coords,
+    reference_case_level_bounds,
+    reference_case_surface_geopotential_values,
+    reference_case_surface_pressure_values,
+    reference_case_terrain_anomaly_values,
+    reference_case_theta_profile,
     surface_geopotential,
     surface_mass_from_pi_s,
     surface_pressure,
@@ -33,45 +36,22 @@ def _difference_threshold(ps, solver: KoehlerReferenceState, factor: float = 100
 
 
 def _build_reference_case(*, grid: str = "regular", ntime: int = 2, level_bounds=None):
-    time, level, latitude, longitude = make_coords(grid=grid, ntime=ntime)
+    time, level, latitude, longitude = reference_case_coords(grid=grid, ntime=ntime)
     pressure = pressure_field(time, level, latitude, longitude)
-    ps = surface_pressure(
-        time,
-        latitude,
-        longitude,
-        np.asarray(
-            [
-                [900.0, 700.0, 500.0, 350.0],
-                [900.0, 700.0, 500.0, 350.0],
-                [900.0, 700.0, 500.0, 350.0],
-                [900.0, 700.0, 500.0, 350.0],
-            ]
-        ),
-    )
+    ps = surface_pressure(time, latitude, longitude, reference_case_surface_pressure_values(latitude, longitude))
     phis = surface_geopotential(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [0.0, 100.0, 200.0, 300.0],
-                [50.0, 150.0, 250.0, 350.0],
-                [100.0, 200.0, 300.0, 400.0],
-                [150.0, 250.0, 350.0, 450.0],
-            ]
-        ),
+        reference_case_surface_geopotential_values(latitude, longitude),
     )
     integrator = build_mass_integrator(level, latitude, longitude, level_bounds=level_bounds)
-    temperature = full_field(
+    temperature = temperature_from_theta_values(
         time,
         level,
         latitude,
         longitude,
-        np.linspace(170.0, 255.0, time.size * level.size * latitude.size * longitude.size).reshape(
-            time.size, level.size, latitude.size, longitude.size
-        ),
-        name="temperature",
-        units="K",
+        reference_case_theta_profile(level)[None, :, None, None],
     )
     pt = potential_temperature(temperature, pressure)
     solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis, level_bounds=level_bounds)
@@ -91,19 +71,18 @@ def _build_reference_case(*, grid: str = "regular", ntime: int = 2, level_bounds
 
 
 def test_reference_state_regression_topography_response_grows_with_terrain_amplitude():
-    time, level, latitude, longitude = make_coords(ntime=2)
+    time, level, latitude, longitude = reference_case_coords(ntime=2)
     pressure = pressure_field(time, level, latitude, longitude)
     ps = surface_pressure(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [900.0, 650.0, 520.0, 420.0],
-                [900.0, 650.0, 520.0, 420.0],
-                [900.0, 650.0, 520.0, 420.0],
-                [900.0, 650.0, 520.0, 420.0],
-            ]
+        reference_case_surface_pressure_values(
+            latitude,
+            longitude,
+            base=910.0,
+            lon_drop=390.0,
+            lat_drop=70.0,
         ),
     )
     temperature = temperature_from_theta_values(
@@ -111,7 +90,7 @@ def test_reference_state_regression_topography_response_grows_with_terrain_ampli
         level,
         latitude,
         longitude,
-        np.asarray([180.0, 200.0, 220.0])[None, :, None, None],
+        reference_case_theta_profile(level)[None, :, None, None],
     )
     pt = potential_temperature(temperature, pressure)
     solver = KoehlerReferenceState()
@@ -121,29 +100,13 @@ def test_reference_state_regression_topography_response_grows_with_terrain_ampli
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [-750.0, -250.0, 250.0, 750.0],
-                [-750.0, -250.0, 250.0, 750.0],
-                [-750.0, -250.0, 250.0, 750.0],
-                [-750.0, -250.0, 250.0, 750.0],
-            ]
-        )
-        + 2000.0,
+        reference_case_terrain_anomaly_values(latitude, longitude, 750.0) + 2000.0,
     )
     anomaly_large = surface_geopotential(
         time,
         latitude,
         longitude,
-        np.asarray(
-            [
-                [-1500.0, -500.0, 500.0, 1500.0],
-                [-1500.0, -500.0, 500.0, 1500.0],
-                [-1500.0, -500.0, 500.0, 1500.0],
-                [-1500.0, -500.0, 500.0, 1500.0],
-            ]
-        )
-        + 2000.0,
+        reference_case_terrain_anomaly_values(latitude, longitude, 1500.0) + 2000.0,
     )
 
     small = solver.solve(pt, pressure, ps, phis=anomaly_small)
@@ -160,12 +123,8 @@ def test_reference_state_regression_topography_response_grows_with_terrain_ampli
 def test_reference_state_regression_level_bounds_and_midpoint_paths_remain_closed_and_monotone(use_bounds):
     level_bounds = None
     if use_bounds:
-        level_bounds = xr.DataArray(
-            np.asarray([[820.0, 600.0], [600.0, 400.0], [400.0, 200.0]]),
-            dims=("level", "bounds"),
-            coords={"level": [700.0, 500.0, 300.0], "bounds": [0, 1]},
-            name="level_bounds",
-        )
+        _, level, _, _ = reference_case_coords(ntime=1)
+        level_bounds = reference_case_level_bounds(level)
 
     case = _build_reference_case(level_bounds=level_bounds)
     solution = case["solution"]

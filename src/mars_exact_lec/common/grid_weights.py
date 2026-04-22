@@ -19,6 +19,20 @@ def _candidate_bounds_names(coord_name: str) -> tuple[str, ...]:
     )
 
 
+def _equal_area_regular_latitude_bounds(size: int) -> np.ndarray:
+    sin_edges = np.linspace(1.0, -1.0, size + 1)
+    upper = np.rad2deg(np.arcsin(np.clip(sin_edges[:-1], -1.0, 1.0)))
+    lower = np.rad2deg(np.arcsin(np.clip(sin_edges[1:], -1.0, 1.0)))
+    return np.column_stack([lower, upper])
+
+
+def _equal_area_regular_latitude_values(size: int) -> np.ndarray:
+    bounds = _equal_area_regular_latitude_bounds(size)
+    sin_lower = np.sin(np.deg2rad(bounds[:, 0]))
+    sin_upper = np.sin(np.deg2rad(bounds[:, 1]))
+    return np.rad2deg(np.arcsin(np.clip(0.5 * (sin_lower + sin_upper), -1.0, 1.0)))
+
+
 def _coerce_bounds(bounds: xr.DataArray, coord_name: str) -> xr.DataArray:
     bounds = xr.DataArray(bounds)
     if bounds.ndim != 2:
@@ -80,6 +94,15 @@ def _derive_latitude_bounds(latitude: xr.DataArray) -> xr.DataArray:
         upper = np.rad2deg(np.arcsin(np.clip(north_edges, -1.0, 1.0)))
         return xr.DataArray(
             np.column_stack([lower, upper]),
+            dims=("latitude", "bounds"),
+            coords={"latitude": latitude.values, "bounds": [0, 1]},
+            name="latitude_bounds",
+        )
+
+    equal_area_reference = _equal_area_regular_latitude_values(values.size)
+    if np.allclose(values, equal_area_reference, atol=5e-8):
+        return xr.DataArray(
+            _equal_area_regular_latitude_bounds(values.size),
             dims=("latitude", "bounds"),
             coords={"latitude": latitude.values, "bounds": [0, 1]},
             name="latitude_bounds",
@@ -169,6 +192,10 @@ def infer_grid(latitude: xr.DataArray) -> str:
     values = np.asarray(latitude.values, dtype=float)
     diffs = np.diff(values)
     if np.allclose(diffs, diffs[0], atol=5e-8):
+        return "regular"
+
+    equal_area_reference = _equal_area_regular_latitude_values(values.size)
+    if np.allclose(values, equal_area_reference, atol=5e-8):
         return "regular"
 
     gauss_nodes, _ = leggauss(values.size)
