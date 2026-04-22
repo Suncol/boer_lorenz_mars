@@ -49,4 +49,5 @@ setup = ["--reconfigure"] # Reconfigure on build
 [tool.pytest.ini_options]
 markers = [
     "live_seba: tests that require an installed SEBA runtime with shtns and numeric_tools",
+    "slow_reference: slow stage-3 reference-state regression tests and future dtheta-convergence tests",
 ]

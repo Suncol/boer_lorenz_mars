@@ -1,4 +1,4 @@
-"""Exact Boer reservoirs: kinetic-energy stores plus phase-2 APE body terms."""
+"""Exact Boer reservoirs: kinetic energy plus stage-3 total APE terms."""
 
 from __future__ import annotations
 
@@ -9,12 +9,18 @@ import xarray as xr
 
 from .._validation import (
     FIELD_DIMS,
+    SURFACE_DIMS,
+    SURFACE_ZONAL_DIMS,
     ZONAL_DIMS,
     ensure_matching_coordinates,
+    ensure_matching_surface_coordinates,
     normalize_field,
+    normalize_surface_field,
+    normalize_surface_zonal_field,
     normalize_zonal_field,
     require_dataarray,
 )
+from ..common.grid_weights import longitude_weights
 from ..common.integrals import MassIntegrator
 from ..common.zonal_ops import representative_eddy, representative_zonal_mean, theta_coverage, zonal_mean
 from ..constants_mars import MARS, MarsConstants
@@ -29,6 +35,12 @@ _ZONAL_EFFICIENCY_KEYS = (
     "N_Z",
     "efficiency_factor_zonal",
     "representative_efficiency_factor",
+)
+_SURFACE_PRESSURE_KEYS = ("pi_s", "surface_reference_pressure", "reference_surface_pressure_full")
+_SURFACE_ZONAL_PRESSURE_KEYS = (
+    "pi_sZ",
+    "surface_reference_pressure_zonal",
+    "reference_surface_pressure_zonal",
 )
 
 
@@ -50,6 +62,12 @@ def _lookup_reference_component(reference_state: Any, candidates: tuple[str, ...
     return None
 
 
+def _surface_zonal_mean(field: xr.DataArray) -> xr.DataArray:
+    field = normalize_surface_field(field, "field")
+    weights = longitude_weights(field.coords["longitude"], normalize=True)
+    return field.weighted(weights).sum(dim="longitude")
+
+
 def _ensure_matching_zonal_coordinates(
     reference: xr.DataArray,
     other: xr.DataArray,
@@ -59,6 +77,25 @@ def _ensure_matching_zonal_coordinates(
     other = normalize_zonal_field(other, name)
 
     for coord_name in ZONAL_DIMS:
+        if coord_name == "time":
+            equal = np.array_equal(reference[coord_name].values, other[coord_name].values)
+        else:
+            equal = np.allclose(reference[coord_name].values, other[coord_name].values)
+        if not equal:
+            raise ValueError(f"Coordinate {coord_name!r} of {name!r} does not match the template.")
+
+    return other
+
+
+def _ensure_matching_surface_zonal_coordinates(
+    reference: xr.DataArray,
+    other: xr.DataArray,
+    name: str,
+) -> xr.DataArray:
+    reference = normalize_surface_zonal_field(reference, "reference")
+    other = normalize_surface_zonal_field(other, name)
+
+    for coord_name in SURFACE_ZONAL_DIMS:
         if coord_name == "time":
             equal = np.array_equal(reference[coord_name].values, other[coord_name].values)
         else:
@@ -86,14 +123,8 @@ def _normalize_reference_field(
     if zonal:
         if dims == set(ZONAL_DIMS):
             return _ensure_matching_zonal_coordinates(template, field, name)
-        if dims == set(FIELD_DIMS):
-            return _ensure_matching_zonal_coordinates(
-                template,
-                zonal_mean(normalize_field(field, name)),
-                name,
-            )
         raise ValueError(
-            f"{name!r} must be scalar or contain exactly the dims {ZONAL_DIMS} or {FIELD_DIMS}; "
+            f"{name!r} must be scalar or contain exactly the dims {ZONAL_DIMS}; "
             f"got {field.dims!r}."
         )
 
@@ -104,6 +135,41 @@ def _normalize_reference_field(
 
     field = normalize_field(field, name)
     ensure_matching_coordinates(template, [field])
+    return field
+
+
+def _normalize_surface_component(
+    value: Any,
+    template: xr.DataArray,
+    name: str,
+    *,
+    zonal: bool,
+    allow_scalar: bool = True,
+) -> xr.DataArray:
+    if np.isscalar(value):
+        if not allow_scalar:
+            raise ValueError(f"{name!r} must be provided as a canonical surface field, not a scalar.")
+        field = xr.full_like(template, float(value))
+        field.name = name
+        return field
+
+    field = require_dataarray(value, name)
+    dims = set(field.dims)
+    if zonal:
+        if dims == set(SURFACE_ZONAL_DIMS):
+            return _ensure_matching_surface_zonal_coordinates(template, field, name)
+        raise ValueError(
+            f"{name!r} must be scalar or contain exactly the dims {SURFACE_ZONAL_DIMS}; "
+            f"got {field.dims!r}."
+        )
+
+    if dims != set(SURFACE_DIMS):
+        raise ValueError(
+            f"{name!r} must be scalar or contain exactly the dims {SURFACE_DIMS}; got {field.dims!r}."
+        )
+
+    field = normalize_surface_field(field, name)
+    ensure_matching_surface_coordinates(template, [field])
     return field
 
 
@@ -219,6 +285,37 @@ def _resolve_efficiency_factor(
     return efficiency
 
 
+def _resolve_surface_reference_pressure(
+    reference_state: Any,
+    explicit_pressure: Any,
+    template: xr.DataArray,
+    *,
+    output_name: str,
+    pressure_keys: tuple[str, ...],
+) -> xr.DataArray:
+    pressure_value = explicit_pressure
+    if pressure_value is None:
+        pressure_value = _lookup_reference_component(reference_state, pressure_keys)
+    if pressure_value is None:
+        raise ValueError(
+            f"Total exact surface terms require reference-state surface diagnostics {pressure_keys[0]!r}."
+        )
+
+    result = _normalize_surface_component(
+        pressure_value,
+        template,
+        output_name,
+        zonal=False,
+        allow_scalar=False,
+    )
+    values = np.asarray(result.values, dtype=float)
+    if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
+        raise ValueError(f"{output_name!r} must remain finite and strictly positive on the canonical surface grid.")
+    result.name = output_name
+    result.attrs.setdefault("units", "Pa")
+    return result
+
+
 def total_horizontal_ke(
     u: xr.DataArray,
     v: xr.DataArray,
@@ -295,12 +392,7 @@ def available_potential_energy_zonal_part1(
     pi_z: xr.DataArray | float | None = None,
     n_z: xr.DataArray | float | None = None,
 ) -> xr.DataArray:
-    """Return ``A_Z1 = ∫_M c_p Θ N_Z [T]_R dm`` in Joules.
-
-    Here ``theta`` denotes the phase-1 volume mask ``Θ``, not potential temperature.
-    This is the phase-2 body term only and omits the explicit surface contribution
-    ``A_Z2``.
-    """
+    """Return ``A_Z1 = ∫_M c_p Θ N_Z [T]_R dm`` in Joules."""
 
     temperature = normalize_field(temperature, "temperature")
     pressure = normalize_field(pressure, "pressure")
@@ -359,11 +451,7 @@ def available_potential_energy_eddy_part1(
     n: xr.DataArray | float | None = None,
     n_z: xr.DataArray | float | None = None,
 ) -> xr.DataArray:
-    """Return ``A_E1 = ∫_M c_p Θ (N - N_Z) T dm`` in Joules.
-
-    This is the phase-2 body term only and omits the explicit surface
-    contribution ``A_E2``.
-    """
+    """Return ``A_E1 = ∫_M c_p Θ (N - N_Z) T dm`` in Joules."""
 
     temperature = normalize_field(temperature, "temperature")
     pressure = normalize_field(pressure, "pressure")
@@ -432,11 +520,7 @@ def available_potential_energy_part1(
     pi: xr.DataArray | float | None = None,
     n: xr.DataArray | float | None = None,
 ) -> xr.DataArray:
-    """Return ``A_1 = ∫_M c_p Θ N T dm`` in Joules.
-
-    This is the phase-2 body contribution to ``A = A_Z + A_E`` before any
-    explicit topographic surface term is added.
-    """
+    """Return ``A_1 = ∫_M c_p Θ N T dm`` in Joules."""
 
     temperature = normalize_field(temperature, "temperature")
     pressure = normalize_field(pressure, "pressure")
@@ -478,16 +562,241 @@ def available_potential_energy_part1(
     return result
 
 
+def available_potential_energy_zonal_part2(
+    ps: xr.DataArray,
+    phis: xr.DataArray,
+    integrator: MassIntegrator,
+    reference_state: Any | None = None,
+    *,
+    pi_sZ: xr.DataArray | float | None = None,
+) -> xr.DataArray:
+    """Return ``A_Z2 = ∫_S (ps - pi_sZ) Phi_s dσ / g`` in Joules."""
+
+    ps = normalize_surface_field(ps, "ps")
+    phis = normalize_surface_field(phis, "phis")
+    ensure_matching_surface_coordinates(ps, [phis])
+
+    pi_sZ_field = _resolve_surface_reference_pressure(
+        reference_state,
+        pi_sZ,
+        ps,
+        output_name="pi_sZ",
+        pressure_keys=_SURFACE_ZONAL_PRESSURE_KEYS,
+    )
+    integrand = (ps - pi_sZ_field) * phis
+    result = integrator.integrate_surface(integrand)
+    result.name = "A_Z2"
+    result.attrs["units"] = "J"
+    result.attrs["long_name"] = "zonal exact available potential energy topographic term"
+    result.attrs["surface_term_included"] = True
+    return result
+
+
+def available_potential_energy_eddy_part2(
+    ps: xr.DataArray,
+    phis: xr.DataArray,
+    integrator: MassIntegrator,
+    reference_state: Any | None = None,
+    *,
+    pi_s: xr.DataArray | float | None = None,
+    pi_sZ: xr.DataArray | float | None = None,
+) -> xr.DataArray:
+    """Return ``A_E2 = ∫_S (pi_sZ - pi_s) Phi_s dσ / g`` in Joules."""
+
+    ps = normalize_surface_field(ps, "ps")
+    phis = normalize_surface_field(phis, "phis")
+    ensure_matching_surface_coordinates(ps, [phis])
+
+    pi_s_field = _resolve_surface_reference_pressure(
+        reference_state,
+        pi_s,
+        ps,
+        output_name="pi_s",
+        pressure_keys=_SURFACE_PRESSURE_KEYS,
+    )
+    pi_sZ_field = _resolve_surface_reference_pressure(
+        reference_state,
+        pi_sZ,
+        ps,
+        output_name="pi_sZ",
+        pressure_keys=_SURFACE_ZONAL_PRESSURE_KEYS,
+    )
+    integrand = (pi_sZ_field - pi_s_field) * phis
+    result = integrator.integrate_surface(integrand)
+    result.name = "A_E2"
+    result.attrs["units"] = "J"
+    result.attrs["long_name"] = "eddy exact available potential energy topographic term"
+    result.attrs["surface_term_included"] = True
+    return result
+
+
+def available_potential_energy_part2(
+    ps: xr.DataArray,
+    phis: xr.DataArray,
+    integrator: MassIntegrator,
+    reference_state: Any | None = None,
+    *,
+    pi_s: xr.DataArray | float | None = None,
+) -> xr.DataArray:
+    """Return ``A_2 = ∫_S (ps - pi_s) Phi_s dσ / g`` in Joules."""
+
+    ps = normalize_surface_field(ps, "ps")
+    phis = normalize_surface_field(phis, "phis")
+    ensure_matching_surface_coordinates(ps, [phis])
+
+    pi_s_field = _resolve_surface_reference_pressure(
+        reference_state,
+        pi_s,
+        ps,
+        output_name="pi_s",
+        pressure_keys=_SURFACE_PRESSURE_KEYS,
+    )
+    integrand = (ps - pi_s_field) * phis
+    result = integrator.integrate_surface(integrand)
+    result.name = "A_2"
+    result.attrs["units"] = "J"
+    result.attrs["long_name"] = "exact available potential energy topographic term"
+    result.attrs["surface_term_included"] = True
+    return result
+
+
+def available_potential_energy_zonal(
+    temperature: xr.DataArray,
+    pressure: xr.DataArray,
+    theta: xr.DataArray,
+    integrator: MassIntegrator,
+    reference_state: Any | None = None,
+    *,
+    ps: xr.DataArray | None = None,
+    phis: xr.DataArray | None = None,
+    potential_temperature_field: xr.DataArray | None = None,
+    pi_z: xr.DataArray | float | None = None,
+    n_z: xr.DataArray | float | None = None,
+    pi_sZ: xr.DataArray | float | None = None,
+) -> xr.DataArray:
+    """Return the total zonal exact APE ``A_Z = A_Z1 + A_Z2`` in Joules."""
+
+    if ps is None or phis is None:
+        raise ValueError("Total exact A_Z requires both 'ps' and 'phis'.")
+    result = available_potential_energy_zonal_part1(
+        temperature,
+        pressure,
+        theta,
+        integrator,
+        reference_state=reference_state,
+        potential_temperature_field=potential_temperature_field,
+        pi_z=pi_z,
+        n_z=n_z,
+    ) + available_potential_energy_zonal_part2(
+        ps,
+        phis,
+        integrator,
+        reference_state=reference_state,
+        pi_sZ=pi_sZ,
+    )
+    result.name = "A_Z"
+    result.attrs["units"] = "J"
+    result.attrs["surface_term_included"] = True
+    return result
+
+
+def available_potential_energy_eddy(
+    temperature: xr.DataArray,
+    pressure: xr.DataArray,
+    theta: xr.DataArray,
+    integrator: MassIntegrator,
+    reference_state: Any | None = None,
+    *,
+    ps: xr.DataArray | None = None,
+    phis: xr.DataArray | None = None,
+    potential_temperature_field: xr.DataArray | None = None,
+    pi: xr.DataArray | float | None = None,
+    pi_z: xr.DataArray | float | None = None,
+    n: xr.DataArray | float | None = None,
+    n_z: xr.DataArray | float | None = None,
+    pi_s: xr.DataArray | float | None = None,
+    pi_sZ: xr.DataArray | float | None = None,
+) -> xr.DataArray:
+    """Return the total eddy exact APE ``A_E = A_E1 + A_E2`` in Joules."""
+
+    if ps is None or phis is None:
+        raise ValueError("Total exact A_E requires both 'ps' and 'phis'.")
+    result = available_potential_energy_eddy_part1(
+        temperature,
+        pressure,
+        theta,
+        integrator,
+        reference_state=reference_state,
+        potential_temperature_field=potential_temperature_field,
+        pi=pi,
+        pi_z=pi_z,
+        n=n,
+        n_z=n_z,
+    ) + available_potential_energy_eddy_part2(
+        ps,
+        phis,
+        integrator,
+        reference_state=reference_state,
+        pi_s=pi_s,
+        pi_sZ=pi_sZ,
+    )
+    result.name = "A_E"
+    result.attrs["units"] = "J"
+    result.attrs["surface_term_included"] = True
+    return result
+
+
+def available_potential_energy(
+    temperature: xr.DataArray,
+    pressure: xr.DataArray,
+    theta: xr.DataArray,
+    integrator: MassIntegrator,
+    reference_state: Any | None = None,
+    *,
+    ps: xr.DataArray | None = None,
+    phis: xr.DataArray | None = None,
+    potential_temperature_field: xr.DataArray | None = None,
+    pi: xr.DataArray | float | None = None,
+    n: xr.DataArray | float | None = None,
+    pi_s: xr.DataArray | float | None = None,
+) -> xr.DataArray:
+    """Return the total exact APE ``A = A_1 + A_2`` in Joules."""
+
+    if ps is None or phis is None:
+        raise ValueError("Total exact A requires both 'ps' and 'phis'.")
+    result = available_potential_energy_part1(
+        temperature,
+        pressure,
+        theta,
+        integrator,
+        reference_state=reference_state,
+        potential_temperature_field=potential_temperature_field,
+        pi=pi,
+        n=n,
+    ) + available_potential_energy_part2(
+        ps,
+        phis,
+        integrator,
+        reference_state=reference_state,
+        pi_s=pi_s,
+    )
+    result.name = "A"
+    result.attrs["units"] = "J"
+    result.attrs["surface_term_included"] = True
+    return result
+
+
 total_available_potential_energy_part1 = available_potential_energy_part1
+total_available_potential_energy_part2 = available_potential_energy_part2
 A_Z1 = available_potential_energy_zonal_part1
 A_E1 = available_potential_energy_eddy_part1
 A1 = available_potential_energy_part1
-
-# Phase-2 compatibility aliases. These currently expose only the body terms and
-# intentionally do not claim to include the explicit topographic surface terms.
-A_Z = available_potential_energy_zonal_part1
-A_E = available_potential_energy_eddy_part1
-A = available_potential_energy_part1
+A_Z2 = available_potential_energy_zonal_part2
+A_E2 = available_potential_energy_eddy_part2
+A2 = available_potential_energy_part2
+A_Z = available_potential_energy_zonal
+A_E = available_potential_energy_eddy
+A = available_potential_energy
 
 
 __all__ = [
@@ -497,10 +806,20 @@ __all__ = [
     "available_potential_energy_zonal_part1",
     "available_potential_energy_eddy_part1",
     "available_potential_energy_part1",
+    "available_potential_energy_zonal_part2",
+    "available_potential_energy_eddy_part2",
+    "available_potential_energy_part2",
+    "available_potential_energy_zonal",
+    "available_potential_energy_eddy",
+    "available_potential_energy",
     "total_available_potential_energy_part1",
+    "total_available_potential_energy_part2",
     "A_Z1",
     "A_E1",
     "A1",
+    "A_Z2",
+    "A_E2",
+    "A2",
     "A_Z",
     "A_E",
     "A",

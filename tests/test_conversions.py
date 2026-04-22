@@ -4,12 +4,16 @@ import pytest
 
 np = pytest.importorskip("numpy")
 
-from mars_exact_lec.boer.conversions import conversion_eddy_ape_to_ke, conversion_zonal_ape_to_ke_part1
+from mars_exact_lec.boer.conversions import (
+    conversion_eddy_ape_to_ke,
+    conversion_zonal_ape_to_eddy_ape,
+    conversion_zonal_ape_to_ke_part1,
+)
 from mars_exact_lec.boer.reservoirs import kinetic_energy_eddy
 from mars_exact_lec.common.integrals import build_mass_integrator, integrate_mass_full
 from mars_exact_lec.io.mask_below_ground import make_theta
 
-from .helpers import full_field, make_coords, pressure_field, surface_pressure
+from .helpers import full_field, make_coords, pressure_field, surface_pressure, temperature_from_theta_values, zonal_field
 
 
 def test_eddy_free_fields_give_zero_ke_and_ce():
@@ -87,3 +91,44 @@ def test_flat_surface_theta_and_zonal_mean_reduce_cleanly():
     pressure = pressure_field(time, level, latitude, longitude)
     theta = make_theta(pressure, surface_pressure(time, latitude, longitude, 900.0))
     np.testing.assert_allclose(theta.values, 1.0)
+
+
+def test_conversion_zonal_ape_to_eddy_ape_rejects_longitude_varying_full_nz():
+    time, level, latitude, longitude = make_coords()
+    pressure = pressure_field(time, level, latitude, longitude)
+    theta = make_theta(pressure, surface_pressure(time, latitude, longitude, 900.0))
+    integrator = build_mass_integrator(level, latitude, longitude)
+
+    temperature = temperature_from_theta_values(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.asarray([180.0, 200.0, 220.0])[None, :, None, None],
+    )
+    u = full_field(time, level, latitude, longitude, 0.0, name="u")
+    v = full_field(time, level, latitude, longitude, 0.0, name="v")
+    omega = full_field(time, level, latitude, longitude, 0.0, name="omega")
+
+    n_z = zonal_field(time, level, latitude, 1.0, name="N_Z")
+    n_z_broadcast = n_z.expand_dims(longitude=longitude).transpose("time", "level", "latitude", "longitude")
+    n_z_bad = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.arange(time.size * level.size * latitude.size * longitude.size).reshape(
+            time.size,
+            level.size,
+            latitude.size,
+            longitude.size,
+        ),
+        name="N_Z_bad",
+    )
+
+    zonal_result = conversion_zonal_ape_to_eddy_ape(temperature, u, v, omega, n_z, theta, integrator)
+    broadcast_result = conversion_zonal_ape_to_eddy_ape(temperature, u, v, omega, n_z_broadcast, theta, integrator)
+
+    np.testing.assert_allclose(zonal_result.values, broadcast_result.values)
+    with pytest.raises(ValueError, match="longitude-varying"):
+        conversion_zonal_ape_to_eddy_ape(temperature, u, v, omega, n_z_bad, theta, integrator)

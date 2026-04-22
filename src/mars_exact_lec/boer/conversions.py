@@ -5,10 +5,18 @@ from __future__ import annotations
 import numpy as np
 import xarray as xr
 
-from .._validation import ensure_matching_coordinates, normalize_field, normalize_zonal_field
-from ..constants_mars import MARS, MarsConstants
+from .._validation import (
+    ensure_matching_coordinates,
+    ensure_matching_surface_coordinates,
+    normalize_field,
+    normalize_surface_field,
+    normalize_zonal_field,
+)
+from ..common.geopotential import resolve_geopotential
 from ..common.integrals import MassIntegrator
+from ..common.time_derivatives import coordinate_derivative, time_derivative
 from ..common.zonal_ops import representative_eddy, representative_zonal_mean, theta_coverage, zonal_mean
+from ..constants_mars import MARS, MarsConstants
 
 
 _METRIC_TOL = 1.0e-12
@@ -20,7 +28,19 @@ def _coerce_to_zonal(field: xr.DataArray, name: str) -> xr.DataArray:
     try:
         return normalize_zonal_field(field, name)
     except ValueError:
-        return zonal_mean(normalize_field(field, name))
+        full = normalize_field(field, name)
+        reference = full.isel(longitude=0, drop=True)
+        reconstructed = reference.expand_dims(longitude=full.coords["longitude"]).transpose(*full.dims)
+        if not np.allclose(
+            np.asarray(full.values, dtype=float),
+            np.asarray(reconstructed.values, dtype=float),
+            equal_nan=True,
+        ):
+            raise ValueError(
+                f"{name!r} must already be zonal or longitude-constant on the canonical full grid; "
+                "longitude-varying full fields are not valid zonal diagnostics."
+            )
+        return reference
 
 
 def _ensure_matching_zonal_coordinates(reference: xr.DataArray, field: xr.DataArray, name: str) -> None:
@@ -37,11 +57,16 @@ def _ensure_matching_zonal_coordinates(reference: xr.DataArray, field: xr.DataAr
             raise ValueError(f"Coordinate {coord_name!r} of {name!r} does not match the reference field.")
 
 
-def _pressure_derivative(field: xr.DataArray) -> xr.DataArray:
+def _pressure_derivative(field: xr.DataArray, *, valid_mask: xr.DataArray | None = None) -> xr.DataArray:
     """Return ``∂field/∂p`` using the canonical pressure coordinate."""
 
-    edge_order = 2 if field.sizes["level"] > 2 else 1
-    return field.differentiate("level", edge_order=edge_order)
+    return coordinate_derivative(
+        field,
+        "level",
+        valid_mask=valid_mask,
+        name=f"d{field.name}_dp" if field.name else "pressure_derivative",
+        derivative_units="per_pascal",
+    )
 
 
 def _meridional_gradient_zonal(field: xr.DataArray, *, radius: float) -> xr.DataArray:
@@ -65,7 +90,7 @@ def _metric_factors(latitude: xr.DataArray, *, constants: MarsConstants) -> tupl
         name="cosphi",
     )
     if np.any(np.abs(cosphi.values) <= _METRIC_TOL):
-        raise ValueError("C_K1 requires latitude points away from exact poles because a*cos(phi) appears in the denominator.")
+        raise ValueError("C_K terms require latitude points away from exact poles because a*cos(phi) appears in the denominator.")
 
     sinphi = xr.DataArray(
         np.sin(lat_radians),
@@ -104,6 +129,148 @@ def _zonal_advective_operator(
     return meridional_term + vertical_term
 
 
+def _normalize_valid_mask(field: xr.DataArray, valid_mask: xr.DataArray | None) -> xr.DataArray:
+    field = normalize_field(field, "field")
+    if valid_mask is None:
+        return xr.ones_like(field, dtype=bool)
+
+    valid_mask = normalize_field(valid_mask, "valid_mask")
+    ensure_matching_coordinates(field, [valid_mask])
+    return valid_mask.astype(bool)
+
+
+def _periodic_segment_indices(valid: np.ndarray) -> list[np.ndarray]:
+    valid_index = np.flatnonzero(valid)
+    if valid_index.size == 0:
+        return []
+
+    splits = np.where(np.diff(valid_index) > 1)[0] + 1
+    segments = [np.asarray(segment, dtype=int) for segment in np.split(valid_index, splits)]
+    if len(segments) > 1 and segments[0][0] == 0 and segments[-1][-1] == valid.size - 1:
+        segments[0] = np.concatenate([segments[-1], segments[0]])
+        segments.pop()
+    return segments
+
+
+def _unwrap_periodic_coordinate(coordinate: np.ndarray, indices: np.ndarray, *, period: float) -> np.ndarray:
+    unwrapped = np.asarray(coordinate[indices], dtype=float).copy()
+    for idx in range(1, unwrapped.size):
+        while unwrapped[idx] <= unwrapped[idx - 1]:
+            unwrapped[idx] += period
+    return unwrapped
+
+
+def _periodic_derivative_all_valid(values: np.ndarray, coordinate: np.ndarray, *, period: float) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    coordinate = np.asarray(coordinate, dtype=float)
+    result = np.full(values.shape, np.nan, dtype=float)
+    if values.size == 1:
+        return result
+    if values.size == 2:
+        slope = (values[1] - values[0]) / (coordinate[1] - coordinate[0])
+        result[:] = slope
+        return result
+
+    for idx in range(values.size):
+        prev_idx = (idx - 1) % values.size
+        next_idx = (idx + 1) % values.size
+        x_prev = float(coordinate[prev_idx])
+        x_curr = float(coordinate[idx])
+        x_next = float(coordinate[next_idx])
+        if prev_idx > idx:
+            x_prev -= period
+        if next_idx < idx:
+            x_next += period
+        result[idx] = np.gradient(
+            np.asarray([values[prev_idx], values[idx], values[next_idx]], dtype=float),
+            np.asarray([x_prev, x_curr, x_next], dtype=float),
+            edge_order=2,
+        )[1]
+    return result
+
+
+def _segmented_periodic_derivative_1d(
+    values: np.ndarray,
+    coordinate: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    period: float,
+) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    coordinate = np.asarray(coordinate, dtype=float)
+    valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(values)
+    result = np.full(values.shape, np.nan, dtype=float)
+    if not np.any(valid):
+        return result
+
+    if np.all(valid):
+        return _periodic_derivative_all_valid(values, coordinate, period=period)
+
+    for indices in _periodic_segment_indices(valid):
+        if indices.size == 1:
+            continue
+        segment_values = values[indices]
+        segment_coordinate = _unwrap_periodic_coordinate(coordinate, indices, period=period)
+        edge_order = 2 if segment_values.size > 2 else 1
+        result[indices] = np.gradient(segment_values, segment_coordinate, edge_order=edge_order)
+    return result
+
+
+def _longitude_gradient(
+    field: xr.DataArray,
+    *,
+    constants: MarsConstants,
+    valid_mask: xr.DataArray | None = None,
+) -> xr.DataArray:
+    latitude = field.coords["latitude"]
+    longitude_deg = field.coords["longitude"]
+    _, _, metric = _metric_factors(latitude, constants=constants)
+    valid_mask = _normalize_valid_mask(field, valid_mask)
+    longitude_rad = xr.DataArray(
+        np.deg2rad(longitude_deg.values),
+        dims=("longitude",),
+        coords={"longitude": longitude_deg.values},
+        name="longitude_radians",
+    )
+    derivative = xr.apply_ufunc(
+        _segmented_periodic_derivative_1d,
+        field.astype(float),
+        longitude_rad.astype(float),
+        valid_mask,
+        kwargs={"period": 2.0 * np.pi},
+        input_core_dims=[["longitude"], ["longitude"], ["longitude"]],
+        output_core_dims=[["longitude"]],
+        vectorize=True,
+        dask="parallelized",
+        output_dtypes=[float],
+    ).transpose(*field.dims)
+    return (derivative / metric).assign_coords(longitude=longitude_deg.values)
+
+
+def _meridional_gradient(
+    field: xr.DataArray,
+    *,
+    constants: MarsConstants,
+    valid_mask: xr.DataArray | None = None,
+) -> xr.DataArray:
+    latitude_deg = field.coords["latitude"]
+    valid_mask = _normalize_valid_mask(field, valid_mask)
+    latitude_rad = xr.DataArray(
+        np.deg2rad(latitude_deg.values),
+        dims=("latitude",),
+        coords={"latitude": latitude_deg.values},
+        name="latitude_radians",
+    )
+    derivative = coordinate_derivative(
+        field,
+        "latitude",
+        coordinate=latitude_rad,
+        valid_mask=valid_mask,
+        name=f"d{field.name}_dlat" if field.name else "meridional_gradient",
+    )
+    return (derivative / constants.a).assign_coords(latitude=latitude_deg.values)
+
+
 def conversion_zonal_ape_to_ke_part1(
     omega: xr.DataArray,
     alpha: xr.DataArray,
@@ -127,6 +294,47 @@ def conversion_zonal_ape_to_ke_part1(
     return result
 
 
+def conversion_zonal_ape_to_ke_part2(
+    ps: xr.DataArray,
+    phis: xr.DataArray,
+    integrator: MassIntegrator,
+) -> xr.DataArray:
+    """Return ``C_Z2 = - ∫_S (dps/dt * Phi_s) dσ / g`` in Watts."""
+
+    ps = normalize_surface_field(ps, "ps")
+    phis = normalize_surface_field(phis, "phis")
+    ensure_matching_surface_coordinates(ps, [phis])
+
+    integrand = -time_derivative(ps) * phis
+    result = integrator.integrate_surface(integrand)
+    result.name = "C_Z2"
+    result.attrs["units"] = "W"
+    return result
+
+
+def conversion_zonal_ape_to_ke(
+    omega: xr.DataArray,
+    alpha: xr.DataArray,
+    theta: xr.DataArray,
+    integrator: MassIntegrator,
+    *,
+    ps: xr.DataArray | None = None,
+    phis: xr.DataArray | None = None,
+) -> xr.DataArray:
+    """Return the total ``C_Z = C_Z1 + C_Z2`` in Watts."""
+
+    if ps is None or phis is None:
+        raise ValueError("Total C_Z requires both 'ps' and 'phis'.")
+    result = conversion_zonal_ape_to_ke_part1(omega, alpha, theta, integrator) + conversion_zonal_ape_to_ke_part2(
+        ps,
+        phis,
+        integrator,
+    )
+    result.name = "C_Z"
+    result.attrs["units"] = "W"
+    return result
+
+
 def conversion_zonal_ape_to_eddy_ape(
     temperature: xr.DataArray,
     u: xr.DataArray,
@@ -138,18 +346,7 @@ def conversion_zonal_ape_to_eddy_ape(
     *,
     constants: MarsConstants = MARS,
 ) -> xr.DataArray:
-    """Return ``C_A`` in Watts.
-
-    The implementation follows the normalized eq. (8):
-
-    ``C_A = - ∫ cp (theta/T) ([Theta T* V*]·∇ + [Theta T* omega*] ∂_p) ((T/theta) N_Z) dm``
-
-    where lower-case ``theta`` is potential temperature and upper-case ``Theta``
-    is the terrain mask carried by the ``theta`` argument in this codebase.
-    Since ``theta/T = (p00/p)^kappa`` and ``T/theta = (p/p00)^kappa`` in
-    pressure coordinates, both thermodynamic factors are evaluated from the
-    pressure-level coordinate, avoiding an unnecessary division by temperature.
-    """
+    """Return ``C_A`` in Watts."""
 
     temperature = normalize_field(temperature, "temperature")
     u = normalize_field(u, "u")
@@ -215,14 +412,7 @@ def conversion_zonal_ke_to_eddy_ke_part1(
     *,
     constants: MarsConstants = MARS,
 ) -> xr.DataArray:
-    """Return ``C_K1`` in Watts.
-
-    This follows the normalized eq. (5), interpreted as the sum of two
-    mean-shear contributions, not their product. Because the shears
-    ``[u]_R / (a cos(phi))`` and ``[v]_R / (a cos(phi))`` are zonal by
-    construction, the longitudinal-gradient contribution vanishes and only the
-    meridional and pressure derivatives are retained.
-    """
+    """Return ``C_K1`` in Watts."""
 
     u = normalize_field(u, "u")
     v = normalize_field(v, "v")
@@ -267,15 +457,132 @@ def conversion_zonal_ke_to_eddy_ke_part1(
     return result
 
 
+def conversion_zonal_ke_to_eddy_ke_part2(
+    u: xr.DataArray,
+    v: xr.DataArray,
+    omega: xr.DataArray,
+    theta: xr.DataArray,
+    integrator: MassIntegrator,
+    *,
+    geopotential: xr.DataArray | None = None,
+    temperature: xr.DataArray | None = None,
+    pressure: xr.DataArray | None = None,
+    ps: xr.DataArray | None = None,
+    phis: xr.DataArray | None = None,
+    constants: MarsConstants = MARS,
+) -> xr.DataArray:
+    """Return ``C_K2`` in Watts."""
+
+    u = normalize_field(u, "u")
+    v = normalize_field(v, "v")
+    omega = normalize_field(omega, "omega")
+    theta = normalize_field(theta, "theta")
+    ensure_matching_coordinates(u, [v, omega, theta])
+    valid_mask = (theta > 0.0).rename("theta_valid_mask")
+
+    phi = resolve_geopotential(
+        geopotential=geopotential,
+        temperature=temperature,
+        pressure=pressure,
+        ps=ps,
+        phis=phis,
+        theta=theta,
+        valid_mask=valid_mask,
+        constants=constants,
+    )
+    ensure_matching_coordinates(u, [phi])
+    phi = phi.where(valid_mask)
+
+    # Boer (1989) Eq. (5') is written in terms of [Theta ∂Phi*/∂x], so the
+    # derivatives must be taken only on the above-ground domain.
+    phi_star = representative_eddy(phi, theta)
+    dphi_dt_star = time_derivative(phi_star, valid_mask=valid_mask)
+    dphi_dp_star = _pressure_derivative(phi_star, valid_mask=valid_mask)
+    dphi_dx_star = _longitude_gradient(phi_star, constants=constants, valid_mask=valid_mask)
+    dphi_dy_star = _meridional_gradient(phi_star, constants=constants, valid_mask=valid_mask)
+
+    u_r = representative_zonal_mean(u, theta)
+    v_r = representative_zonal_mean(v, theta)
+    omega_r = representative_zonal_mean(omega, theta)
+
+    tendency_term = zonal_mean(theta * dphi_dt_star)
+    gradient_x_term = zonal_mean(theta * dphi_dx_star)
+    gradient_y_term = zonal_mean(theta * dphi_dy_star)
+    pressure_term = zonal_mean(theta * dphi_dp_star)
+
+    integrand = tendency_term + u_r * gradient_x_term + v_r * gradient_y_term + omega_r * pressure_term
+    result = integrator.integrate_zonal(integrand)
+    result.name = "C_K2"
+    result.attrs["units"] = "W"
+    return result
+
+
+def conversion_zonal_ke_to_eddy_ke(
+    u: xr.DataArray,
+    v: xr.DataArray,
+    omega: xr.DataArray,
+    theta: xr.DataArray,
+    integrator: MassIntegrator,
+    *,
+    geopotential: xr.DataArray | None = None,
+    temperature: xr.DataArray | None = None,
+    pressure: xr.DataArray | None = None,
+    ps: xr.DataArray | None = None,
+    phis: xr.DataArray | None = None,
+    constants: MarsConstants = MARS,
+) -> xr.DataArray:
+    """Return the total ``C_K = C_K1 + C_K2`` in Watts."""
+
+    result = conversion_zonal_ke_to_eddy_ke_part1(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        constants=constants,
+    ) + conversion_zonal_ke_to_eddy_ke_part2(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        geopotential=geopotential,
+        temperature=temperature,
+        pressure=pressure,
+        ps=ps,
+        phis=phis,
+        constants=constants,
+    )
+    result.name = "C_K"
+    result.attrs["units"] = "W"
+    return result
+
+
+C_Z1 = conversion_zonal_ape_to_ke_part1
+C_Z2 = conversion_zonal_ape_to_ke_part2
+C_Z = conversion_zonal_ape_to_ke
 C_A = conversion_zonal_ape_to_eddy_ape
+C_E = conversion_eddy_ape_to_ke
 C_K1 = conversion_zonal_ke_to_eddy_ke_part1
+C_K2 = conversion_zonal_ke_to_eddy_ke_part2
+C_K = conversion_zonal_ke_to_eddy_ke
 
 
 __all__ = [
     "conversion_zonal_ape_to_ke_part1",
+    "conversion_zonal_ape_to_ke_part2",
+    "conversion_zonal_ape_to_ke",
     "conversion_eddy_ape_to_ke",
     "conversion_zonal_ape_to_eddy_ape",
     "conversion_zonal_ke_to_eddy_ke_part1",
+    "conversion_zonal_ke_to_eddy_ke_part2",
+    "conversion_zonal_ke_to_eddy_ke",
+    "C_Z1",
+    "C_Z2",
+    "C_Z",
+    "C_E",
     "C_A",
     "C_K1",
+    "C_K2",
+    "C_K",
 ]

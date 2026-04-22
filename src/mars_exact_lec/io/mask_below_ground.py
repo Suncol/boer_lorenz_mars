@@ -8,6 +8,32 @@ import xarray as xr
 from .._validation import normalize_field, require_dataarray
 
 
+def _coordinate_matches(reference: xr.DataArray, current: xr.DataArray, coord_name: str) -> bool:
+    reference_values = reference.coords[coord_name].values
+    current_values = current.coords[coord_name].values
+    if coord_name == "time":
+        return np.array_equal(reference_values, current_values)
+    return np.allclose(reference_values, current_values)
+
+
+def _broadcast_surface_pressure(ps: xr.DataArray, pressure: xr.DataArray) -> xr.DataArray:
+    if set(ps.dims) == {"time", "latitude", "longitude"}:
+        ps = ps.transpose("time", "latitude", "longitude")
+        for coord_name in ("time", "latitude", "longitude"):
+            if not _coordinate_matches(pressure, ps, coord_name):
+                raise ValueError(f"Coordinate {coord_name!r} of 'ps' does not match the pressure grid.")
+        return ps
+
+    if set(ps.dims) == {"latitude", "longitude"}:
+        ps = ps.transpose("latitude", "longitude")
+        for coord_name in ("latitude", "longitude"):
+            if not _coordinate_matches(pressure, ps, coord_name):
+                raise ValueError(f"Coordinate {coord_name!r} of 'ps' does not match the pressure grid.")
+        return ps.expand_dims(time=pressure.coords["time"]).transpose("time", "latitude", "longitude")
+
+    raise ValueError("'ps' must have dims ('time', 'latitude', 'longitude') or ('latitude', 'longitude').")
+
+
 def make_theta(pressure: xr.DataArray, ps: xr.DataArray) -> xr.DataArray:
     """Return the sharp above-ground mask Theta.
 
@@ -29,14 +55,7 @@ def make_theta(pressure: xr.DataArray, ps: xr.DataArray) -> xr.DataArray:
     pressure = normalize_field(pressure, "pressure")
     ps = require_dataarray(ps, "ps")
 
-    if set(ps.dims) == {"time", "latitude", "longitude"}:
-        ps = ps.transpose("time", "latitude", "longitude")
-    elif set(ps.dims) == {"latitude", "longitude"}:
-        ps = ps.transpose("latitude", "longitude")
-    else:
-        raise ValueError(
-            "'ps' must have dims ('time', 'latitude', 'longitude') or ('latitude', 'longitude')."
-        )
+    ps = _broadcast_surface_pressure(ps, pressure)
 
     theta = xr.where(pressure < ps.broadcast_like(pressure), 1.0, 0.0)
     theta.name = "Theta"
@@ -64,6 +83,9 @@ def apply_below_ground_mask(field: xr.DataArray, theta: xr.DataArray) -> xr.Data
 
     field = normalize_field(field, "field")
     theta = normalize_field(theta, "theta")
+    for coord_name in field.dims:
+        if not _coordinate_matches(field, theta, coord_name):
+            raise ValueError(f"Coordinate {coord_name!r} of 'theta' does not match 'field'.")
     masked = field.where(theta > 0.0)
     masked.name = field.name
     masked.attrs.update(field.attrs)

@@ -46,6 +46,17 @@ def test_theta_partial_truncation_and_equal_pressure_exclusion():
     assert float(theta.isel(time=0, level=2, latitude=0, longitude=2)) == 0.0
 
 
+def test_theta_accepts_time_invariant_2d_surface_pressure():
+    time, level, latitude, longitude = make_coords()
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 800.0).isel(time=0, drop=True)
+
+    theta = make_theta(pressure, ps)
+
+    assert theta.dims == pressure.dims
+    np.testing.assert_allclose(theta.isel(time=0).values, theta.isel(time=1).values)
+
+
 def test_below_ground_mask_and_apply_mask():
     time, level, latitude, longitude = make_coords()
     pressure = pressure_field(time, level, latitude, longitude)
@@ -58,3 +69,23 @@ def test_below_ground_mask_and_apply_mask():
     np.testing.assert_array_equal(mask.values, theta.values == 0.0)
     assert masked.isnull().isel(time=0, level=0).all()
     assert masked.notnull().isel(time=0, level=2).all()
+
+
+def test_make_theta_rejects_same_shape_surface_coordinate_mismatch():
+    time, level, latitude, longitude = make_coords()
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 900.0).assign_coords(time=[10.0, 11.0])
+
+    with pytest.raises(ValueError, match="Coordinate 'time'"):
+        make_theta(pressure, ps)
+
+
+def test_apply_below_ground_mask_rejects_same_shape_coordinate_mismatch():
+    time, level, latitude, longitude = make_coords()
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 450.0)
+    theta = make_theta(pressure, ps).assign_coords(longitude=longitude.values + 0.5)
+    field = full_field(time, level, latitude, longitude, 3.0, name="field")
+
+    with pytest.raises(ValueError, match="Coordinate 'longitude'"):
+        apply_below_ground_mask(field, theta)

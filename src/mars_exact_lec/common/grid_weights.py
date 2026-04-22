@@ -44,7 +44,10 @@ def _coerce_bounds(bounds: xr.DataArray, coord_name: str) -> xr.DataArray:
     return bounds.transpose(coord_name, "bounds")
 
 
-def _get_explicit_bounds(coord: xr.DataArray) -> xr.DataArray | None:
+def _get_explicit_bounds(coord: xr.DataArray, bounds: xr.DataArray | None = None) -> xr.DataArray | None:
+    if bounds is not None:
+        return _coerce_bounds(bounds, coord.name)
+
     bounds_name = coord.attrs.get("bounds")
     if bounds_name and bounds_name in coord.coords:
         return _coerce_bounds(coord.coords[bounds_name], coord.name)
@@ -120,13 +123,13 @@ def _derive_longitude_bounds(longitude: xr.DataArray) -> xr.DataArray:
     )
 
 
-def latitude_bounds(latitude: xr.DataArray) -> xr.DataArray:
+def latitude_bounds(latitude: xr.DataArray, *, bounds: xr.DataArray | None = None) -> xr.DataArray:
     """Return latitude bounds, using explicit bounds when available."""
 
     latitude = normalize_coordinate(latitude, "latitude")
-    bounds = _get_explicit_bounds(latitude)
-    if bounds is not None:
-        values = np.asarray(bounds.values, dtype=float)
+    resolved_bounds = _get_explicit_bounds(latitude, bounds=bounds)
+    if resolved_bounds is not None:
+        values = np.asarray(resolved_bounds.values, dtype=float)
         lower = np.clip(np.minimum(values[:, 0], values[:, 1]), -90.0, 90.0)
         upper = np.clip(np.maximum(values[:, 0], values[:, 1]), -90.0, 90.0)
         return xr.DataArray(
@@ -138,13 +141,13 @@ def latitude_bounds(latitude: xr.DataArray) -> xr.DataArray:
     return _derive_latitude_bounds(latitude)
 
 
-def longitude_bounds(longitude: xr.DataArray) -> xr.DataArray:
+def longitude_bounds(longitude: xr.DataArray, *, bounds: xr.DataArray | None = None) -> xr.DataArray:
     """Return longitude bounds, using explicit bounds when available."""
 
     longitude = normalize_coordinate(longitude, "longitude")
-    bounds = _get_explicit_bounds(longitude)
-    if bounds is not None:
-        values = np.asarray(bounds.values, dtype=float)
+    resolved_bounds = _get_explicit_bounds(longitude, bounds=bounds)
+    if resolved_bounds is not None:
+        values = np.asarray(resolved_bounds.values, dtype=float)
         widths = values[:, 1] - values[:, 0]
         if np.any(widths <= 0.0) or not np.isclose(widths.sum(), 360.0, atol=1e-6):
             raise ValueError(
@@ -176,7 +179,13 @@ def infer_grid(latitude: xr.DataArray) -> str:
     raise ValueError("Latitude grid is neither global regular nor Gaussian.")
 
 
-def latitude_weights(latitude: xr.DataArray, grid: str | None = None, normalize: bool = False) -> xr.DataArray:
+def latitude_weights(
+    latitude: xr.DataArray,
+    grid: str | None = None,
+    normalize: bool = False,
+    *,
+    bounds: xr.DataArray | None = None,
+) -> xr.DataArray:
     """Return latitude weights derived from geometric band areas."""
 
     latitude = normalize_coordinate(latitude, "latitude")
@@ -185,9 +194,9 @@ def latitude_weights(latitude: xr.DataArray, grid: str | None = None, normalize:
     if grid is None:
         grid = infer_grid(latitude)
 
-    bounds = latitude_bounds(latitude)
-    lat_south = np.deg2rad(bounds.isel(bounds=0))
-    lat_north = np.deg2rad(bounds.isel(bounds=1))
+    resolved_bounds = latitude_bounds(latitude, bounds=bounds)
+    lat_south = np.deg2rad(resolved_bounds.isel(bounds=0))
+    lat_north = np.deg2rad(resolved_bounds.isel(bounds=1))
     weights = xr.DataArray(
         np.sin(lat_north.values) - np.sin(lat_south.values),
         dims=("latitude",),
@@ -199,13 +208,18 @@ def latitude_weights(latitude: xr.DataArray, grid: str | None = None, normalize:
     return weights
 
 
-def longitude_weights(longitude: xr.DataArray, normalize: bool = False) -> xr.DataArray:
+def longitude_weights(
+    longitude: xr.DataArray,
+    normalize: bool = False,
+    *,
+    bounds: xr.DataArray | None = None,
+) -> xr.DataArray:
     """Return longitude weights from cyclic cell widths."""
 
     longitude = normalize_coordinate(longitude, "longitude")
-    bounds = longitude_bounds(longitude)
+    resolved_bounds = longitude_bounds(longitude, bounds=bounds)
     widths = xr.DataArray(
-        np.deg2rad(bounds.isel(bounds=1).values - bounds.isel(bounds=0).values),
+        np.deg2rad(resolved_bounds.isel(bounds=1).values - resolved_bounds.isel(bounds=0).values),
         dims=("longitude",),
         coords={"longitude": longitude.values},
         name="longitude_widths",
@@ -215,13 +229,18 @@ def longitude_weights(longitude: xr.DataArray, normalize: bool = False) -> xr.Da
     return widths
 
 
-def zonal_band_area(latitude: xr.DataArray, radius: float = MARS.a) -> xr.DataArray:
+def zonal_band_area(
+    latitude: xr.DataArray,
+    radius: float = MARS.a,
+    *,
+    latitude_cell_bounds: xr.DataArray | None = None,
+) -> xr.DataArray:
     """Return the full-ring area of each latitude band."""
 
     latitude = normalize_coordinate(latitude, "latitude")
-    bounds = latitude_bounds(latitude)
-    lat_south = np.deg2rad(bounds.isel(bounds=0))
-    lat_north = np.deg2rad(bounds.isel(bounds=1))
+    resolved_bounds = latitude_bounds(latitude, bounds=latitude_cell_bounds)
+    lat_south = np.deg2rad(resolved_bounds.isel(bounds=0))
+    lat_north = np.deg2rad(resolved_bounds.isel(bounds=1))
     area = 2.0 * np.pi * radius**2 * (np.sin(lat_north.values) - np.sin(lat_south.values))
     return xr.DataArray(
         area,
@@ -232,13 +251,20 @@ def zonal_band_area(latitude: xr.DataArray, radius: float = MARS.a) -> xr.DataAr
     )
 
 
-def cell_area(latitude: xr.DataArray, longitude: xr.DataArray, radius: float = MARS.a) -> xr.DataArray:
+def cell_area(
+    latitude: xr.DataArray,
+    longitude: xr.DataArray,
+    radius: float = MARS.a,
+    *,
+    latitude_cell_bounds: xr.DataArray | None = None,
+    longitude_cell_bounds: xr.DataArray | None = None,
+) -> xr.DataArray:
     """Return the area of each latitude-longitude grid cell."""
 
     latitude = normalize_coordinate(latitude, "latitude")
     longitude = normalize_coordinate(longitude, "longitude")
-    band_area = zonal_band_area(latitude, radius=radius)
-    lon_widths = longitude_weights(longitude, normalize=True)
+    band_area = zonal_band_area(latitude, radius=radius, latitude_cell_bounds=latitude_cell_bounds)
+    lon_widths = longitude_weights(longitude, normalize=True, bounds=longitude_cell_bounds)
     area = band_area * lon_widths
     area = area.transpose("latitude", "longitude")
     area.name = "cell_area"

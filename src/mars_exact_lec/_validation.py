@@ -10,6 +10,8 @@ import xarray as xr
 
 FIELD_DIMS = ("time", "level", "latitude", "longitude")
 ZONAL_DIMS = ("time", "level", "latitude")
+SURFACE_DIMS = ("time", "latitude", "longitude")
+SURFACE_ZONAL_DIMS = ("time", "latitude")
 
 
 def require_dataarray(obj: xr.DataArray, name: str) -> xr.DataArray:
@@ -100,6 +102,35 @@ def normalize_zonal_field(field: xr.DataArray, name: str) -> xr.DataArray:
     return field
 
 
+def normalize_surface_field(field: xr.DataArray, name: str) -> xr.DataArray:
+    """Validate and transpose a surface field to ``(time, latitude, longitude)``."""
+
+    field = require_dataarray(field, name)
+    if set(field.dims) != set(SURFACE_DIMS):
+        raise ValueError(
+            f"{name!r} must contain exactly the dims {SURFACE_DIMS}; got {field.dims!r}."
+        )
+
+    field = field.transpose(*SURFACE_DIMS)
+    _validate_latitude(_require_1d_coord(field.coords["latitude"], "latitude"))
+    _validate_longitude(_require_1d_coord(field.coords["longitude"], "longitude"))
+    return field
+
+
+def normalize_surface_zonal_field(field: xr.DataArray, name: str) -> xr.DataArray:
+    """Validate and transpose a zonal surface field to ``(time, latitude)``."""
+
+    field = require_dataarray(field, name)
+    if set(field.dims) != set(SURFACE_ZONAL_DIMS):
+        raise ValueError(
+            f"{name!r} must contain exactly the dims {SURFACE_ZONAL_DIMS}; got {field.dims!r}."
+        )
+
+    field = field.transpose(*SURFACE_ZONAL_DIMS)
+    _validate_latitude(_require_1d_coord(field.coords["latitude"], "latitude"))
+    return field
+
+
 def normalize_coordinate(coord: xr.DataArray, name: str) -> xr.DataArray:
     """Validate a standalone coordinate array."""
 
@@ -135,4 +166,24 @@ def ensure_matching_coordinates(reference: xr.DataArray, others: Iterable[xr.Dat
             if not equal:
                 raise ValueError(
                     f"Coordinate {coord_name!r} of field_{idx} does not match the reference field."
+                )
+
+
+def ensure_matching_surface_coordinates(
+    reference: xr.DataArray,
+    others: Iterable[xr.DataArray],
+) -> None:
+    """Require the canonical surface coordinates to match exactly across fields."""
+
+    reference = normalize_surface_field(reference, "reference")
+    for idx, other in enumerate(others):
+        other = normalize_surface_field(other, f"field_{idx}")
+        for coord_name in SURFACE_DIMS:
+            if coord_name == "time":
+                equal = np.array_equal(reference[coord_name].values, other[coord_name].values)
+            else:
+                equal = np.allclose(reference[coord_name].values, other[coord_name].values)
+            if not equal:
+                raise ValueError(
+                    f"Coordinate {coord_name!r} of field_{idx} does not match the reference surface field."
                 )

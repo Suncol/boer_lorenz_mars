@@ -7,12 +7,41 @@ from dataclasses import dataclass
 import numpy as np
 import xarray as xr
 
-from .._validation import normalize_coordinate, normalize_field, normalize_zonal_field, require_dataarray
+from .._validation import (
+    normalize_coordinate,
+    normalize_field,
+    normalize_surface_field,
+    normalize_zonal_field,
+    require_dataarray,
+)
 from ..constants_mars import MARS, MarsConstants
 from .grid_weights import cell_area, zonal_band_area
 
 
-def _get_explicit_level_bounds(level: xr.DataArray) -> xr.DataArray | None:
+def _coordinate_matches(reference: xr.DataArray, current: xr.DataArray, coord_name: str) -> bool:
+    reference_values = reference.coords[coord_name].values
+    current_values = current.coords[coord_name].values
+    return np.allclose(reference_values, current_values)
+
+
+def _get_explicit_level_bounds(level: xr.DataArray, bounds: xr.DataArray | None = None) -> xr.DataArray | None:
+    if bounds is not None:
+        bounds = xr.DataArray(bounds)
+        if bounds.ndim != 2:
+            raise ValueError("Pressure level bounds must be two-dimensional.")
+        if bounds.shape[-1] != 2 and bounds.shape[0] == 2:
+            bounds = xr.DataArray(
+                bounds.values.T,
+                dims=("level", "bounds"),
+                coords={"level": level.values, "bounds": [0, 1]},
+            )
+        else:
+            if bounds.dims[0] != "level":
+                bounds = bounds.rename({bounds.dims[0]: "level"})
+            if bounds.dims[1] != "bounds":
+                bounds = bounds.rename({bounds.dims[1]: "bounds"})
+        return bounds.transpose("level", "bounds")
+
     bounds_name = level.attrs.get("bounds")
     candidates = [bounds_name] if bounds_name else []
     candidates.extend(["level_bounds", "level_bnds", "plev_bounds", "plev_bnds"])
@@ -37,13 +66,13 @@ def _get_explicit_level_bounds(level: xr.DataArray) -> xr.DataArray | None:
     return None
 
 
-def pressure_level_edges(level: xr.DataArray) -> xr.DataArray:
+def pressure_level_edges(level: xr.DataArray, *, bounds: xr.DataArray | None = None) -> xr.DataArray:
     """Return strictly descending pressure interfaces for a pressure coordinate."""
 
     level = normalize_coordinate(level, "level")
-    bounds = _get_explicit_level_bounds(level)
-    if bounds is not None:
-        values = np.asarray(bounds.values, dtype=float)
+    resolved_bounds = _get_explicit_level_bounds(level, bounds=bounds)
+    if resolved_bounds is not None:
+        values = np.asarray(resolved_bounds.values, dtype=float)
         upper = np.maximum(values[:, 0], values[:, 1])
         lower = np.minimum(values[:, 0], values[:, 1])
         if values.shape[0] > 1 and not np.allclose(lower[:-1], upper[1:]):
@@ -73,11 +102,11 @@ def pressure_level_edges(level: xr.DataArray) -> xr.DataArray:
     )
 
 
-def delta_p(level: xr.DataArray) -> xr.DataArray:
+def delta_p(level: xr.DataArray, *, bounds: xr.DataArray | None = None) -> xr.DataArray:
     """Return positive pressure thicknesses for descending pressure levels."""
 
     level = normalize_coordinate(level, "level")
-    edges = pressure_level_edges(level)
+    edges = pressure_level_edges(level, bounds=bounds)
     thickness = np.asarray(edges.values[:-1] - edges.values[1:], dtype=float)
     if np.any(thickness <= 0.0):
         raise ValueError("Derived pressure thickness must be strictly positive.")
@@ -132,15 +161,50 @@ class MassIntegrator:
         weights.attrs["units"] = "kg"
         return weights
 
+    @property
+    def surface_weights(self) -> xr.DataArray:
+        weights = self.cell_area / self.constants.g
+        weights.name = "surface_weights"
+        weights.attrs["units"] = "m s2"
+        return weights
+
+    def _ensure_full_grid_matches(self, field: xr.DataArray) -> None:
+        if not _coordinate_matches(self.delta_p, field, "level"):
+            raise ValueError("Field level coordinates do not match the integrator grid.")
+        if not _coordinate_matches(self.cell_area, field, "latitude"):
+            raise ValueError("Field latitude coordinates do not match the integrator grid.")
+        if not _coordinate_matches(self.cell_area, field, "longitude"):
+            raise ValueError("Field longitude coordinates do not match the integrator grid.")
+
+    def _ensure_zonal_grid_matches(self, field: xr.DataArray) -> None:
+        if not _coordinate_matches(self.delta_p, field, "level"):
+            raise ValueError("Field level coordinates do not match the integrator grid.")
+        if not _coordinate_matches(self.zonal_band_area, field, "latitude"):
+            raise ValueError("Field latitude coordinates do not match the integrator grid.")
+
+    def _ensure_surface_grid_matches(self, field: xr.DataArray) -> None:
+        if not _coordinate_matches(self.cell_area, field, "latitude"):
+            raise ValueError("Field latitude coordinates do not match the integrator grid.")
+        if not _coordinate_matches(self.cell_area, field, "longitude"):
+            raise ValueError("Field longitude coordinates do not match the integrator grid.")
+
     def integrate_full(self, field: xr.DataArray) -> xr.DataArray:
         field = normalize_field(field, "field")
+        self._ensure_full_grid_matches(field)
         weights = self.full_mass_weights
         return (field * weights).sum(dim=("level", "latitude", "longitude"))
 
     def integrate_zonal(self, field: xr.DataArray) -> xr.DataArray:
         field = normalize_zonal_field(field, "field")
+        self._ensure_zonal_grid_matches(field)
         weights = self.zonal_mass_weights
         return (field * weights).sum(dim=("level", "latitude"))
+
+    def integrate_surface(self, field: xr.DataArray) -> xr.DataArray:
+        field = normalize_surface_field(field, "field")
+        self._ensure_surface_grid_matches(field)
+        weights = self.surface_weights
+        return (field * weights).sum(dim=("latitude", "longitude"))
 
 
 def build_mass_integrator(
@@ -148,6 +212,10 @@ def build_mass_integrator(
     latitude: xr.DataArray,
     longitude: xr.DataArray,
     constants: MarsConstants = MARS,
+    *,
+    level_bounds: xr.DataArray | None = None,
+    latitude_cell_bounds: xr.DataArray | None = None,
+    longitude_cell_bounds: xr.DataArray | None = None,
 ) -> MassIntegrator:
     """Build a phase-1 Mars mass integrator from 1D coordinates."""
 
@@ -155,9 +223,19 @@ def build_mass_integrator(
     latitude = normalize_coordinate(latitude, "latitude")
     longitude = normalize_coordinate(longitude, "longitude")
     return MassIntegrator(
-        delta_p=delta_p(level),
-        cell_area=cell_area(latitude, longitude, radius=constants.a),
-        zonal_band_area=zonal_band_area(latitude, radius=constants.a),
+        delta_p=delta_p(level, bounds=level_bounds),
+        cell_area=cell_area(
+            latitude,
+            longitude,
+            radius=constants.a,
+            latitude_cell_bounds=latitude_cell_bounds,
+            longitude_cell_bounds=longitude_cell_bounds,
+        ),
+        zonal_band_area=zonal_band_area(
+            latitude,
+            radius=constants.a,
+            latitude_cell_bounds=latitude_cell_bounds,
+        ),
         constants=constants,
     )
 
@@ -170,6 +248,9 @@ def integrate_mass_full(
     latitude: xr.DataArray | None = None,
     longitude: xr.DataArray | None = None,
     constants: MarsConstants = MARS,
+    level_bounds: xr.DataArray | None = None,
+    latitude_cell_bounds: xr.DataArray | None = None,
+    longitude_cell_bounds: xr.DataArray | None = None,
 ) -> xr.DataArray:
     """Integrate a full 4D field over atmospheric mass."""
 
@@ -178,7 +259,15 @@ def integrate_mass_full(
         level = level if level is not None else field.coords["level"]
         latitude = latitude if latitude is not None else field.coords["latitude"]
         longitude = longitude if longitude is not None else field.coords["longitude"]
-        integrator = build_mass_integrator(level, latitude, longitude, constants=constants)
+        integrator = build_mass_integrator(
+            level,
+            latitude,
+            longitude,
+            constants=constants,
+            level_bounds=level_bounds,
+            latitude_cell_bounds=latitude_cell_bounds,
+            longitude_cell_bounds=longitude_cell_bounds,
+        )
     return integrator.integrate_full(field)
 
 
@@ -189,6 +278,8 @@ def integrate_mass_zonal(
     level: xr.DataArray | None = None,
     latitude: xr.DataArray | None = None,
     constants: MarsConstants = MARS,
+    level_bounds: xr.DataArray | None = None,
+    latitude_cell_bounds: xr.DataArray | None = None,
 ) -> xr.DataArray:
     """Integrate an already zonal-mean field over atmospheric mass."""
 
@@ -199,12 +290,53 @@ def integrate_mass_zonal(
         if latitude is None:
             raise ValueError("A latitude coordinate is required to build a zonal mass integrator.")
         integrator = MassIntegrator(
-            delta_p=delta_p(level),
-            cell_area=cell_area(latitude, _default_global_longitude(), radius=constants.a),
-            zonal_band_area=zonal_band_area(latitude, radius=constants.a),
+            delta_p=delta_p(level, bounds=level_bounds),
+            cell_area=cell_area(
+                latitude,
+                _default_global_longitude(),
+                radius=constants.a,
+                latitude_cell_bounds=latitude_cell_bounds,
+            ),
+            zonal_band_area=zonal_band_area(
+                latitude,
+                radius=constants.a,
+                latitude_cell_bounds=latitude_cell_bounds,
+            ),
             constants=constants,
         )
     return integrator.integrate_zonal(field)
+
+
+def integrate_surface(
+    field: xr.DataArray,
+    integrator: MassIntegrator | None = None,
+    *,
+    latitude: xr.DataArray | None = None,
+    longitude: xr.DataArray | None = None,
+    constants: MarsConstants = MARS,
+    latitude_cell_bounds: xr.DataArray | None = None,
+    longitude_cell_bounds: xr.DataArray | None = None,
+) -> xr.DataArray:
+    """Integrate a surface field using ``dσ / g`` weights."""
+
+    field = normalize_surface_field(field, "field")
+    if integrator is None:
+        latitude = latitude if latitude is not None else field.coords["latitude"]
+        longitude = longitude if longitude is not None else field.coords["longitude"]
+        if latitude is None or longitude is None:
+            raise ValueError("Latitude and longitude are required to build a surface integrator.")
+        weights = (
+            cell_area(
+                latitude,
+                longitude,
+                radius=constants.a,
+                latitude_cell_bounds=latitude_cell_bounds,
+                longitude_cell_bounds=longitude_cell_bounds,
+            )
+            / constants.g
+        )
+        return (field * weights).sum(dim=("latitude", "longitude"))
+    return integrator.integrate_surface(field)
 
 
 def _default_global_longitude() -> xr.DataArray:
@@ -224,4 +356,5 @@ __all__ = [
     "build_mass_integrator",
     "integrate_mass_full",
     "integrate_mass_zonal",
+    "integrate_surface",
 ]
