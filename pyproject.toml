@@ -50,4 +50,5 @@ setup = ["--reconfigure"] # Reconfigure on build
 markers = [
     "live_seba: tests that require an installed SEBA runtime with shtns and numeric_tools",
     "slow_reference: slow stage-3 reference-state regression tests and future dtheta-convergence tests",
+    "legacy_reference_internal: finite-volume internal reference-profile semantics",
 ]

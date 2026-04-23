@@ -8,7 +8,7 @@ from mars_exact_lec.boer.reservoirs import A
 from mars_exact_lec.common.integrals import build_mass_integrator
 from mars_exact_lec.constants_mars import MARS
 from mars_exact_lec.io.mask_below_ground import make_theta
-from mars_exact_lec.reference_state import KoehlerReferenceState, potential_temperature
+from mars_exact_lec.reference_state import FiniteVolumeReferenceState, potential_temperature
 
 from .helpers import (
     finite_reference_profile,
@@ -28,7 +28,7 @@ from .helpers import (
 )
 
 
-pytestmark = pytest.mark.slow_reference
+pytestmark = [pytest.mark.slow_reference, pytest.mark.legacy_reference_internal]
 
 
 def _build_stress_case(
@@ -99,7 +99,7 @@ def _build_stress_case(
     pt = potential_temperature(temperature, pressure)
     theta_mask = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
-    solver = KoehlerReferenceState(
+    solver = FiniteVolumeReferenceState(
         pressure_tolerance=pressure_tolerance,
         max_iterations=max_iterations,
         surface_pressure_policy=surface_pressure_policy_for_case(
@@ -152,7 +152,7 @@ def _build_flat_partial_bottom_case(*, pressure_tolerance: float, max_iterations
     pt = potential_temperature(temperature, pressure)
     theta_mask = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
-    solver = KoehlerReferenceState(
+    solver = FiniteVolumeReferenceState(
         pressure_tolerance=pressure_tolerance,
         max_iterations=max_iterations,
         surface_pressure_policy=surface_pressure_policy_for_case(

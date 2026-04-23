@@ -12,7 +12,7 @@ from mars_exact_lec.common.topography_measure import TopographyAwareMeasure
 from mars_exact_lec.common.zonal_ops import representative_zonal_mean, weighted_representative_zonal_mean
 from mars_exact_lec.constants_mars import MARS
 from mars_exact_lec.io.mask_below_ground import make_theta
-from mars_exact_lec.reference_state import KoehlerReferenceState, potential_temperature
+from mars_exact_lec.reference_state import FiniteVolumeReferenceState, potential_temperature
 from mars_exact_lec.reference_state.koehler_solver import _solve_reference_family
 
 from .helpers import (
@@ -44,7 +44,7 @@ def _max_abs(values) -> float:
     return float(np.nanmax(np.abs(np.asarray(values, dtype=float))))
 
 
-def _difference_threshold(ps, solver: KoehlerReferenceState, factor: float = 100.0) -> float:
+def _difference_threshold(ps, solver: FiniteVolumeReferenceState, factor: float = 100.0) -> float:
     return factor * solver.pressure_tolerance * float(np.asarray(ps.values, dtype=float).max())
 
 
@@ -80,8 +80,8 @@ def _solver_for_case(
     level_bounds=None,
     pressure_tolerance: float = 1.0e-6,
     max_iterations: int = 64,
-) -> KoehlerReferenceState:
-    return KoehlerReferenceState(
+) -> FiniteVolumeReferenceState:
+    return FiniteVolumeReferenceState(
         pressure_tolerance=pressure_tolerance,
         max_iterations=max_iterations,
         surface_pressure_policy=surface_pressure_policy_for_case(
@@ -301,7 +301,7 @@ def test_reference_state_exposes_clip_domain_metadata_on_surface_outputs():
     )
     pt = potential_temperature(temperature, pressure)
 
-    solution = KoehlerReferenceState(surface_pressure_policy="clip").solve(pt, pressure, ps, phis=phis)
+    solution = FiniteVolumeReferenceState(surface_pressure_policy="clip").solve(pt, pressure, ps, phis=phis)
 
     assert solution.ps_effective.attrs["surface_pressure_policy"] == "clip"
     assert solution.ps_effective.attrs["domain"] == "truncated_to_model_pressure_domain"

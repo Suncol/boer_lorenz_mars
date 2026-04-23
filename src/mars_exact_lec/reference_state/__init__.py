@@ -12,7 +12,16 @@ from .interpolate_isentropes import (
     pressure_level_edges,
     pressure_at_isentropes,
 )
-from .koehler_solver import KoehlerReferenceState, ReferenceStateSolution
+from .finite_volume_solver import FiniteVolumeReferenceState
+from .koehler1986_preprocessing import (
+    build_theta_levels,
+    interpolate_pressure_to_koehler_isentropes,
+    koehler_isentropic_layer_mass_statistics,
+    resolve_surface_potential_temperature,
+)
+from .koehler1986_solver import Koehler1986ReferenceState
+from .koehler_solver import KoehlerReferenceState
+from .solution import ReferenceStateSolution
 
 __all__ = [
     "ISENTROPIC_DIM",
@@ -26,5 +35,11 @@ __all__ = [
     "pressure_at_isentropes",
     "isentropic_layer_mass_statistics",
     "ReferenceStateSolution",
+    "FiniteVolumeReferenceState",
+    "build_theta_levels",
+    "resolve_surface_potential_temperature",
+    "interpolate_pressure_to_koehler_isentropes",
+    "koehler_isentropic_layer_mass_statistics",
+    "Koehler1986ReferenceState",
     "KoehlerReferenceState",
 ]

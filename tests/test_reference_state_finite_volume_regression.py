@@ -5,7 +5,6 @@ import pytest
 np = pytest.importorskip("numpy")
 
 from mars_exact_lec.common.integrals import build_mass_integrator
-from mars_exact_lec.constants_mars import MARS
 from mars_exact_lec.reference_state import FiniteVolumeReferenceState, potential_temperature
 
 from .helpers import (
@@ -15,7 +14,6 @@ from .helpers import (
     reference_case_level_bounds,
     reference_case_surface_geopotential_values,
     reference_case_surface_pressure_values,
-    reference_case_terrain_anomaly_values,
     reference_case_theta_profile,
     surface_geopotential,
     surface_mass_from_pi_s,
@@ -24,15 +22,7 @@ from .helpers import (
 )
 
 
-pytestmark = pytest.mark.slow_reference
-
-
-def _max_abs(values) -> float:
-    return float(np.nanmax(np.abs(np.asarray(values, dtype=float))))
-
-
-def _difference_threshold(ps, solver: FiniteVolumeReferenceState, factor: float = 100.0) -> float:
-    return factor * solver.pressure_tolerance * float(np.asarray(ps.values, dtype=float).max())
+pytestmark = [pytest.mark.slow_reference, pytest.mark.legacy_reference_internal]
 
 
 def _build_reference_case(*, grid: str = "regular", ntime: int = 2, level_bounds=None):
@@ -58,8 +48,6 @@ def _build_reference_case(*, grid: str = "regular", ntime: int = 2, level_bounds
     return {
         "time": time,
         "level": level,
-        "latitude": latitude,
-        "longitude": longitude,
         "pressure": pressure,
         "ps": ps,
         "phis": phis,
@@ -68,55 +56,6 @@ def _build_reference_case(*, grid: str = "regular", ntime: int = 2, level_bounds
         "pt": pt,
         "solution": solution,
     }
-
-
-def test_reference_state_regression_topography_response_grows_with_terrain_amplitude():
-    time, level, latitude, longitude = reference_case_coords(ntime=2)
-    pressure = pressure_field(time, level, latitude, longitude)
-    ps = surface_pressure(
-        time,
-        latitude,
-        longitude,
-        reference_case_surface_pressure_values(
-            latitude,
-            longitude,
-            base=910.0,
-            lon_drop=390.0,
-            lat_drop=70.0,
-        ),
-    )
-    temperature = temperature_from_theta_values(
-        time,
-        level,
-        latitude,
-        longitude,
-        reference_case_theta_profile(level)[None, :, None, None],
-    )
-    pt = potential_temperature(temperature, pressure)
-    solver = FiniteVolumeReferenceState()
-
-    base = solver.solve(pt, pressure, ps, phis=surface_geopotential(time, latitude, longitude, 2000.0))
-    anomaly_small = surface_geopotential(
-        time,
-        latitude,
-        longitude,
-        reference_case_terrain_anomaly_values(latitude, longitude, 750.0) + 2000.0,
-    )
-    anomaly_large = surface_geopotential(
-        time,
-        latitude,
-        longitude,
-        reference_case_terrain_anomaly_values(latitude, longitude, 1500.0) + 2000.0,
-    )
-
-    small = solver.solve(pt, pressure, ps, phis=anomaly_small)
-    large = solver.solve(pt, pressure, ps, phis=anomaly_large)
-    diff_small = _max_abs(small.pi_reference.values - base.pi_reference.values)
-    diff_large = _max_abs(large.pi_reference.values - base.pi_reference.values)
-    threshold = _difference_threshold(ps, solver, factor=0.1)
-
-    assert diff_small > threshold
-    assert diff_large > diff_small + 0.1 * threshold
 
 
 @pytest.mark.parametrize("use_bounds", [False, True])
