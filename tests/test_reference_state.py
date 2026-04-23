@@ -37,6 +37,7 @@ from .helpers import (
     surface_zonal_mean,
     temperature_from_theta_values,
 )
+from .helpers_exact import build_flat_reference_case as build_shared_flat_reference_case
 
 
 def _max_abs(values) -> float:
@@ -90,6 +91,30 @@ def _solver_for_case(
             pressure_tolerance=pressure_tolerance,
         ),
     )
+
+
+def _assert_all_exact_ape_terms_zero(case):
+    pressure = case["pressure"]
+    temperature = case["temperature"]
+    theta_mask = case["theta_mask"]
+    integrator = case["integrator"]
+    measure = case["measure"]
+    ps = case["ps"]
+    phis = case["phis"]
+    solution = case["solution"]
+
+    for term in (
+        A(temperature, pressure, theta_mask, integrator, reference_state=solution, measure=measure, ps=ps, phis=phis),
+        A_Z(temperature, pressure, theta_mask, integrator, reference_state=solution, measure=measure, ps=ps, phis=phis),
+        A_E(temperature, pressure, theta_mask, integrator, reference_state=solution, measure=measure, ps=ps, phis=phis),
+        A1(temperature, pressure, theta_mask, integrator, reference_state=solution, measure=measure, ps=ps),
+        A_Z1(temperature, pressure, theta_mask, integrator, reference_state=solution, measure=measure, ps=ps),
+        A_E1(temperature, pressure, theta_mask, integrator, reference_state=solution, measure=measure, ps=ps),
+        A2(ps, phis, integrator, reference_state=solution, measure=measure),
+        A_Z2(ps, phis, integrator, reference_state=solution, measure=measure),
+        A_E2(ps, phis, integrator, reference_state=solution, measure=measure),
+    ):
+        np.testing.assert_allclose(term.values, 0.0, rtol=0.0, atol=1.0e-10)
 
 
 def test_reference_state_reproduces_stable_flat_reference_and_zero_ape():
@@ -169,6 +194,26 @@ def test_reference_state_reproduces_stable_flat_reference_and_zero_ape():
     )
 
 
+def test_reference_state_zero_ape_in_raise_mode_with_nonzero_flat_phis():
+    case = build_shared_flat_reference_case(
+        ntime=1,
+        level_values=(900.0, 700.0, 500.0),
+        ps_value=1000.0,
+        phis_value=2000.0,
+        theta_profile=(210.0, 230.0, 250.0),
+    )
+    pressure = case["pressure"]
+    ps = case["ps"]
+    pt = case["potential_temperature"]
+    solution = case["solution"]
+
+    assert case["policy"] == "raise"
+    np.testing.assert_allclose(solution.reference_pressure(pt).values, pressure.values, rtol=0.0, atol=1.0e-10)
+    np.testing.assert_allclose(solution.pi_s.values, ps.values, rtol=0.0, atol=1.0e-10)
+    np.testing.assert_allclose(solution.pi_sZ.values, ps.values, rtol=0.0, atol=1.0e-10)
+    _assert_all_exact_ape_terms_zero(case)
+
+
 def test_reference_state_flat_partial_cell_surface_pressure_matches_ps_inside_bottom_layer():
     time = xr.DataArray([0.0], dims=("time",), coords={"time": [0.0]}, attrs={"units": "hours"})
     level = xr.DataArray(
@@ -219,6 +264,52 @@ def test_available_potential_energy_body_terms_require_ps_or_explicit_measure():
         A_Z1(temperature, pressure, theta, integrator, n_z=1.0)
     with pytest.raises(ValueError, match="provide 'ps' or an explicit 'measure'"):
         A_E1(temperature, pressure, theta, integrator, n=1.0, n_z=1.0)
+
+
+def test_available_potential_energy_body_term_exposes_clip_domain_metadata():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[800.0, 400.0], nlat=2, nlon=4)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 1100.0)
+    theta = make_theta(pressure, ps)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    temperature = temperature_from_theta_values(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.asarray([180.0, 200.0])[None, :, None, None],
+    )
+
+    a1 = A1(temperature, pressure, theta, integrator, ps=ps, surface_pressure_policy="clip", n=1.0)
+
+    assert a1.attrs["surface_pressure_policy"] == "clip"
+    assert a1.attrs["domain"] == "truncated_to_model_pressure_domain"
+    assert a1.attrs["not_exact_full_atmosphere"] is True
+
+
+def test_reference_state_exposes_clip_domain_metadata_on_surface_outputs():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[800.0, 400.0], nlat=2, nlon=4)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 1100.0)
+    phis = surface_geopotential(time, latitude, longitude, 0.0)
+    temperature = temperature_from_theta_values(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.asarray([180.0, 200.0])[None, :, None, None],
+    )
+    pt = potential_temperature(temperature, pressure)
+
+    solution = KoehlerReferenceState(surface_pressure_policy="clip").solve(pt, pressure, ps, phis=phis)
+
+    assert solution.ps_effective.attrs["surface_pressure_policy"] == "clip"
+    assert solution.ps_effective.attrs["domain"] == "truncated_to_model_pressure_domain"
+    assert solution.ps_effective.attrs["not_exact_full_atmosphere"] is True
+    assert solution.total_mass.attrs["domain"] == "truncated_to_model_pressure_domain"
+    assert solution.reference_surface_pressure.attrs["surface_pressure_policy"] == "clip"
+    assert solution.pi_s.attrs["not_exact_full_atmosphere"] is True
+    assert solution.pi_sZ.attrs["domain"] == "truncated_to_model_pressure_domain"
 
 
 def test_reference_state_solve_uses_explicit_level_bounds_when_provided():
@@ -957,6 +1048,11 @@ def test_reference_state_zonal_surface_pressure_uses_measure_aware_representativ
 
     assert _max_abs(weighted_theta - sharp_theta) > 1.0e-3
     np.testing.assert_allclose(solution.ps_effective.values, measure.effective_surface_pressure.values)
+    assert solution.ps_effective.attrs["domain"] == measure.effective_surface_pressure.attrs["domain"]
+    assert solution.total_mass.attrs["surface_pressure_policy"] == measure.surface_pressure_policy
+    assert solution.reference_surface_pressure.attrs["domain"] == measure.effective_surface_pressure.attrs["domain"]
+    assert solution.pi_s.attrs["not_exact_full_atmosphere"] == measure.effective_surface_pressure.attrs["not_exact_full_atmosphere"]
+    assert solution.pi_sZ.attrs["surface_pressure_policy"] == measure.surface_pressure_policy
     np.testing.assert_allclose(solution.pi_sZ.values, weighted_family["pi_s"])
     assert not np.allclose(solution.pi_sZ.values, sharp_family["pi_s"], rtol=1.0e-6, atol=1.0e-8)
 

@@ -90,11 +90,51 @@ def _effective_surface_pressure(ps: xr.DataArray, measure: TopographyAwareMeasur
     return measure.effective_surface_pressure
 
 
-def _annotate_quantity(result: xr.DataArray, *, units: str, base_quantity: str) -> xr.DataArray:
+def _annotate_quantity(
+    result: xr.DataArray,
+    *,
+    units: str,
+    base_quantity: str,
+    measure: TopographyAwareMeasure | None = None,
+    extra_attrs: dict[str, object] | None = None,
+) -> xr.DataArray:
     result.attrs["units"] = units
     result.attrs["normalization"] = "global_integral"
     result.attrs["base_quantity"] = base_quantity
+    if measure is not None:
+        result.attrs.update(measure.domain_metadata)
+    if extra_attrs is not None:
+        result.attrs.update(extra_attrs)
     return result
+
+
+def _ck2_boundary_attrs() -> dict[str, object]:
+    """Return machine-readable provenance for the C_K2 boundary approximation."""
+
+    return {
+        "ck2_horizontal_gradient_scheme": "segmented_finite_difference_v2",
+        "ck2_meridional_gradient_scheme": "segmented_coordinate_derivative_v2",
+        "ck2_boundary_treatment": "centered_interior__one_sided_open_boundary",
+        "ck2_singleton_segment_policy": "exclude_from_directional_zonal_average",
+        "ck2_derivative_mask": "theta_sharp_above_ground",
+    }
+
+
+def _supported_directional_zonal_term(derivative: xr.DataArray, weight: xr.DataArray) -> xr.DataArray:
+    """Return ``[w D]`` while explicitly excluding unsupported derivative points.
+
+    This helper intentionally does not renormalize over the supported subset. It
+    computes the geometric zonal mean of the weighted derivative, with
+    unsupported points contributing zero weight and zero tendency.
+    """
+
+    derivative = normalize_field(derivative, "derivative")
+    weight = normalize_field(weight, "weight")
+    ensure_matching_coordinates(derivative, [weight])
+    support_mask = xr.apply_ufunc(np.isfinite, derivative, dask="allowed")
+    derivative_eff = xr.where(support_mask, derivative, 0.0)
+    weight_eff = xr.where(support_mask, weight, 0.0)
+    return zonal_mean(weight_eff * derivative_eff)
 
 
 def _resolved_measure(
@@ -290,6 +330,13 @@ def _segmented_periodic_derivative_1d(
     *,
     period: float,
 ) -> np.ndarray:
+    """Differentiate a masked cyclic 1D field on contiguous valid segments.
+
+    Fully valid rings use a periodic centered stencil. Open segments use a
+    centered interior with one-sided boundaries, two-point segments reduce to a
+    first-order slope, and singleton segments are left unsupported as ``NaN``.
+    """
+
     values = np.asarray(values, dtype=float)
     coordinate = np.asarray(coordinate, dtype=float)
     valid = np.asarray(valid_mask, dtype=bool) & np.isfinite(values)
@@ -316,6 +363,8 @@ def _longitude_gradient(
     constants: MarsConstants,
     valid_mask: xr.DataArray | None = None,
 ) -> xr.DataArray:
+    """Return ``(1 / a cos(phi)) ∂field/∂lambda`` on the masked above-ground domain."""
+
     latitude = field.coords["latitude"]
     longitude_deg = field.coords["longitude"]
     _, _, metric = _metric_factors(latitude, constants=constants)
@@ -347,6 +396,8 @@ def _meridional_gradient(
     constants: MarsConstants,
     valid_mask: xr.DataArray | None = None,
 ) -> xr.DataArray:
+    """Return ``(1 / a) ∂field/∂phi`` on contiguous valid latitude segments."""
+
     latitude_deg = field.coords["latitude"]
     valid_mask = _normalize_valid_mask(field, valid_mask)
     latitude_rad = xr.DataArray(
@@ -396,7 +447,7 @@ def conversion_zonal_ape_to_ke_part1(
     integrand = -coverage * omega_r * alpha_r
     result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "C_Z1"
-    return _annotate_quantity(result, units="W", base_quantity="power")
+    return _annotate_quantity(result, units="W", base_quantity="power", measure=measure)
 
 
 def conversion_zonal_ape_to_ke_part2(
@@ -424,7 +475,7 @@ def conversion_zonal_ape_to_ke_part2(
     integrand = -time_derivative(ps_effective) * phis
     result = integrator.integrate_surface(integrand)
     result.name = "C_Z2"
-    return _annotate_quantity(result, units="W", base_quantity="power")
+    return _annotate_quantity(result, units="W", base_quantity="power", measure=measure)
 
 
 def conversion_zonal_ape_to_ke(
@@ -466,7 +517,7 @@ def conversion_zonal_ape_to_ke(
         surface_pressure_policy=surface_pressure_policy,
     )
     result.name = "C_Z"
-    return _annotate_quantity(result, units="W", base_quantity="power")
+    return _annotate_quantity(result, units="W", base_quantity="power", measure=measure)
 
 
 def conversion_zonal_ape_to_eddy_ape(
@@ -524,7 +575,7 @@ def conversion_zonal_ape_to_eddy_ape(
     integrand = -constants.cp * inverse_exner * advective_tendency
     result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "C_A"
-    return _annotate_quantity(result, units="W", base_quantity="power")
+    return _annotate_quantity(result, units="W", base_quantity="power", measure=measure)
 
 
 def conversion_eddy_ape_to_ke(
@@ -559,7 +610,7 @@ def conversion_eddy_ape_to_ke(
     integrand = -zonal_mean(weight * omega_star * alpha_star)
     result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "C_E"
-    return _annotate_quantity(result, units="W", base_quantity="power")
+    return _annotate_quantity(result, units="W", base_quantity="power", measure=measure)
 
 
 def conversion_zonal_ke_to_eddy_ke_part1(
@@ -625,7 +676,7 @@ def conversion_zonal_ke_to_eddy_ke_part1(
     integrand = -metric * (u_block + v_block)
     result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "C_K1"
-    return _annotate_quantity(result, units="W", base_quantity="power")
+    return _annotate_quantity(result, units="W", base_quantity="power", measure=measure)
 
 
 def conversion_zonal_ke_to_eddy_ke_part2(
@@ -644,7 +695,17 @@ def conversion_zonal_ke_to_eddy_ke_part2(
     surface_pressure_policy: str = "raise",
     constants: MarsConstants = MARS,
 ) -> xr.DataArray:
-    """Return ``C_K2`` in Watts."""
+    """Return ``C_K2`` in Watts.
+
+    ``C_K2`` is the most topography-boundary-sensitive exact-Boer conversion
+    term in this implementation. The derivative domain is the sharp
+    above-ground mask ``theta > 0``; horizontal gradients are evaluated with
+    segmented finite differences on that masked domain. Fully valid cyclic
+    rings use centered periodic differences, open segments use centered
+    interiors with one-sided boundaries, two-point segments reduce to a
+    first-order slope, and singleton segments are treated as unsupported and
+    excluded from the directional zonal average.
+    """
 
     u = normalize_field(u, "u")
     v = normalize_field(v, "v")
@@ -688,15 +749,21 @@ def conversion_zonal_ke_to_eddy_ke_part2(
     v_r = _representative_mean(v, theta, measure)
     omega_r = _representative_mean(omega, theta, measure)
 
-    tendency_term = zonal_mean(weight * dphi_dt_star)
-    gradient_x_term = zonal_mean(weight * dphi_dx_star)
-    gradient_y_term = zonal_mean(weight * dphi_dy_star)
-    pressure_term = zonal_mean(weight * dphi_dp_star)
+    tendency_term = _supported_directional_zonal_term(dphi_dt_star, weight)
+    gradient_x_term = _supported_directional_zonal_term(dphi_dx_star, weight)
+    gradient_y_term = _supported_directional_zonal_term(dphi_dy_star, weight)
+    pressure_term = _supported_directional_zonal_term(dphi_dp_star, weight)
 
     integrand = tendency_term + u_r * gradient_x_term + v_r * gradient_y_term + omega_r * pressure_term
     result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "C_K2"
-    return _annotate_quantity(result, units="W", base_quantity="power")
+    return _annotate_quantity(
+        result,
+        units="W",
+        base_quantity="power",
+        measure=measure,
+        extra_attrs=_ck2_boundary_attrs(),
+    )
 
 
 def conversion_zonal_ke_to_eddy_ke(
@@ -715,7 +782,12 @@ def conversion_zonal_ke_to_eddy_ke(
     surface_pressure_policy: str = "raise",
     constants: MarsConstants = MARS,
 ) -> xr.DataArray:
-    """Return the total ``C_K = C_K1 + C_K2`` in Watts."""
+    """Return the total ``C_K = C_K1 + C_K2`` in Watts.
+
+    The total inherits the same boundary-approximation provenance as
+    ``C_K2`` because the topographic contribution is computed on the masked
+    above-ground domain with segmented finite differences.
+    """
 
     measure = _resolved_measure(
         integrator,
@@ -751,7 +823,13 @@ def conversion_zonal_ke_to_eddy_ke(
         constants=constants,
     )
     result.name = "C_K"
-    return _annotate_quantity(result, units="W", base_quantity="power")
+    return _annotate_quantity(
+        result,
+        units="W",
+        base_quantity="power",
+        measure=measure,
+        extra_attrs=_ck2_boundary_attrs(),
+    )
 
 
 C_Z1 = conversion_zonal_ape_to_ke_part1

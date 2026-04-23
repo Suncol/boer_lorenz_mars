@@ -210,6 +210,47 @@ clear error instead of silently falling back to the old whole-cell mass measure.
 `surface_pressure_policy` is `"raise"`; use `"clip"` explicitly when you want to truncate
 columns that extend below the deepest model interface.
 
+If you pass both `measure=` and `ps=`, they must come from the same raw surface-pressure field.
+The exact branch treats the explicit `measure` as authoritative and uses `ps` only to validate
+that provenance. This check is intentionally strict: in `clip` mode, two different raw `ps`
+fields are still considered incompatible even if they happen to clip to the same `p_s_eff`.
+If you want a different `surface_pressure_policy`, rebuild the `measure`; passing a new
+`surface_pressure_policy=` alongside an explicit `measure` does not override the policy stored
+inside that measure.
+
+When `surface_pressure_policy="clip"`, the exact branch computes diagnostics on the truncated
+model pressure domain rather than the full atmospheric column implied by the raw `ps`. This is
+surfaced explicitly in attrs on measure-aware exact outputs:
+
+- `surface_pressure_policy = "clip"`
+- `domain = "truncated_to_model_pressure_domain"`
+- `not_exact_full_atmosphere = True`
+
+For symmetry, the `raise` path also writes domain metadata:
+
+- `surface_pressure_policy = "raise"`
+- `domain = "full_model_pressure_domain"`
+- `not_exact_full_atmosphere = False`
+
+These attrs are intentionally machine-readable. They are preserved on exact reservoir and
+conversion diagnostics, reference-state outputs driven by the same measure, and downstream
+per-area normalization helpers.
+
+Among the exact conversion terms, `C_K2` is the most sensitive to topography-boundary
+discretization. Its public outputs now carry additional machine-readable provenance attrs:
+
+- `ck2_horizontal_gradient_scheme`
+- `ck2_meridional_gradient_scheme`
+- `ck2_boundary_treatment`
+- `ck2_singleton_segment_policy`
+- `ck2_derivative_mask`
+
+These attrs document that `C_K2` is evaluated on the sharp above-ground `Theta` mask with
+segmented finite differences rather than a fully conservative finite-volume face operator.
+This is an intentional approximation contract. A single `C_K2` value should not be
+interpreted as analytically exact at complex topographic boundaries without complementary
+resolution or topography-smoothing sensitivity checks.
+
 Low-level Boer diagnostics continue to return global integrals in `J` and `W`. To compare against
 paper figures reported in `J m-2` or `W m-2`, normalize them explicitly with
 `mars_exact_lec.common.to_per_area()` or `mars_exact_lec.common.normalize_dataset_per_area()`.

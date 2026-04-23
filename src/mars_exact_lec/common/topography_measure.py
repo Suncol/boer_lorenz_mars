@@ -44,6 +44,99 @@ def _validate_surface_pressure_policy(policy: str) -> str:
     return normalized
 
 
+def _domain_metadata_from_policy(surface_pressure_policy: str) -> dict[str, str | bool]:
+    normalized_policy = _validate_surface_pressure_policy(surface_pressure_policy)
+    if normalized_policy == "clip":
+        return {
+            "surface_pressure_policy": "clip",
+            "domain": "truncated_to_model_pressure_domain",
+            "not_exact_full_atmosphere": True,
+        }
+    return {
+        "surface_pressure_policy": "raise",
+        "domain": "full_model_pressure_domain",
+        "not_exact_full_atmosphere": False,
+    }
+
+
+def _annotate_with_domain_metadata(
+    field: xr.DataArray,
+    *,
+    surface_pressure_policy: str,
+) -> xr.DataArray:
+    annotated = field.copy(deep=False)
+    annotated.attrs = dict(field.attrs)
+    annotated.attrs.update(_domain_metadata_from_policy(surface_pressure_policy))
+    return annotated
+
+
+def _surface_pressure_comparison_atol(pressure_tolerance: float) -> float:
+    return max(float(pressure_tolerance), 1.0e-12)
+
+
+def _surface_pressure_max_abs_difference(reference: xr.DataArray, current: xr.DataArray) -> float:
+    difference = np.abs(
+        np.asarray(reference.values, dtype=float) - np.asarray(current.values, dtype=float)
+    )
+    return float(np.nanmax(difference)) if difference.size else 0.0
+
+
+def _surface_pressure_values_match(
+    reference: xr.DataArray,
+    current: xr.DataArray,
+    *,
+    pressure_tolerance: float,
+) -> tuple[bool, float]:
+    max_abs_difference = _surface_pressure_max_abs_difference(reference, current)
+    matches = np.allclose(
+        np.asarray(reference.values, dtype=float),
+        np.asarray(current.values, dtype=float),
+        rtol=0.0,
+        atol=_surface_pressure_comparison_atol(pressure_tolerance),
+        equal_nan=True,
+    )
+    return bool(matches), max_abs_difference
+
+
+def _expected_effective_surface_pressure(
+    surface_pressure: xr.DataArray,
+    integrator: MassIntegrator,
+    *,
+    level_bounds: xr.DataArray | None = None,
+    pressure_tolerance: float = 1.0e-6,
+    surface_pressure_policy: str = "raise",
+) -> xr.DataArray:
+    level_edges = pressure_level_edges(integrator.delta_p.coords["level"], bounds=level_bounds)
+    deepest_level_edge = float(level_edges.isel(level_edge=0))
+    normalized_policy = _validate_surface_pressure_policy(surface_pressure_policy)
+
+    if normalized_policy == "raise":
+        too_deep = np.asarray(surface_pressure.values, dtype=float) > deepest_level_edge + float(pressure_tolerance)
+        if np.any(too_deep):
+            raise ValueError(
+                "Surface pressure extends below the deepest model pressure interface; "
+                "use surface_pressure_policy='clip' to truncate to the model domain."
+            )
+        effective_surface_pressure = surface_pressure
+    else:
+        effective_surface_pressure = xr.apply_ufunc(
+            np.minimum,
+            surface_pressure,
+            xr.full_like(surface_pressure, deepest_level_edge, dtype=float),
+        )
+
+    effective_surface_pressure = effective_surface_pressure.astype(float)
+    effective_surface_pressure.name = "ps_effective"
+    effective_surface_pressure.attrs.update(
+        {
+            "units": "Pa",
+            "long_name": "effective surface pressure used by the exact finite-volume measure",
+            "surface_pressure_policy": normalized_policy,
+        }
+    )
+    return effective_surface_pressure
+
+
 def _validate_measure_compatibility(
     measure: "TopographyAwareMeasure",
     integrator: MassIntegrator,
@@ -73,10 +166,39 @@ def _validate_measure_compatibility(
     if surface_pressure is not None:
         surface_pressure = _coerce_surface_pressure(surface_pressure, integrator)
         for coord_name in ("time", "latitude", "longitude"):
-            if not _coordinate_matches(measure.effective_surface_pressure, surface_pressure, coord_name):
+            if not _coordinate_matches(measure.surface_pressure, surface_pressure, coord_name):
                 raise ValueError(
                     f"Explicit 'measure' does not match the {coord_name!r} coordinate of 'surface_pressure'."
                 )
+        matches_surface_pressure, max_abs_difference = _surface_pressure_values_match(
+            measure.surface_pressure,
+            surface_pressure,
+            pressure_tolerance=measure.pressure_tolerance,
+        )
+        if not matches_surface_pressure:
+            raise ValueError(
+                "Explicit 'measure' was built from a different surface pressure field than the supplied 'ps' "
+                f"(max |Δps| = {max_abs_difference:.6g} Pa). Rebuild the measure from this 'ps' or omit 'measure'."
+            )
+
+        expected_effective_surface_pressure = _expected_effective_surface_pressure(
+            surface_pressure,
+            measure.integrator,
+            level_bounds=measure.level_bounds,
+            pressure_tolerance=measure.pressure_tolerance,
+            surface_pressure_policy=measure.surface_pressure_policy,
+        )
+        matches_effective_surface_pressure, max_effective_difference = _surface_pressure_values_match(
+            measure.effective_surface_pressure,
+            expected_effective_surface_pressure,
+            pressure_tolerance=measure.pressure_tolerance,
+        )
+        if not matches_effective_surface_pressure:
+            raise ValueError(
+                "Explicit 'measure' stores an effective surface pressure inconsistent with its raw "
+                f"'surface_pressure' and policy (max |Δps_effective| = {max_effective_difference:.6g} Pa). "
+                "Rebuild the measure from the supplied 'ps'."
+            )
 
 
 @dataclass(frozen=True)
@@ -102,9 +224,7 @@ class TopographyAwareMeasure:
                     f"Coordinate {coord_name!r} of 'effective_surface_pressure' does not match 'surface_pressure'."
                 )
 
-        object.__setattr__(self, "surface_pressure", surface_pressure)
-        object.__setattr__(self, "effective_surface_pressure", effective_surface_pressure)
-        object.__setattr__(self, "surface_pressure_policy", _validate_surface_pressure_policy(self.surface_pressure_policy))
+        normalized_policy = _validate_surface_pressure_policy(self.surface_pressure_policy)
 
         if self.level_bounds is not None:
             level_bounds = xr.DataArray(self.level_bounds)
@@ -113,10 +233,50 @@ class TopographyAwareMeasure:
             level_bounds = level_bounds.transpose("level", "bounds")
             if not _coordinate_matches(self.integrator.delta_p, level_bounds, "level"):
                 raise ValueError("Coordinate 'level' of 'level_bounds' does not match the integrator grid.")
-            object.__setattr__(self, "level_bounds", level_bounds)
+        else:
+            level_bounds = None
 
         if float(self.pressure_tolerance) < 0.0:
             raise ValueError("'pressure_tolerance' must be non-negative.")
+
+        expected_effective_surface_pressure = _expected_effective_surface_pressure(
+            surface_pressure,
+            self.integrator,
+            level_bounds=level_bounds,
+            pressure_tolerance=float(self.pressure_tolerance),
+            surface_pressure_policy=normalized_policy,
+        )
+        matches_effective_surface_pressure, max_abs_difference = _surface_pressure_values_match(
+            effective_surface_pressure,
+            expected_effective_surface_pressure,
+            pressure_tolerance=float(self.pressure_tolerance),
+        )
+        if not matches_effective_surface_pressure:
+            raise ValueError(
+                "'effective_surface_pressure' is inconsistent with 'surface_pressure', "
+                f"'surface_pressure_policy', and the integrator geometry (max |Δps_effective| = {max_abs_difference:.6g} Pa)."
+            )
+
+        object.__setattr__(
+            self,
+            "surface_pressure",
+            _annotate_with_domain_metadata(surface_pressure, surface_pressure_policy=normalized_policy),
+        )
+        object.__setattr__(
+            self,
+            "effective_surface_pressure",
+            _annotate_with_domain_metadata(effective_surface_pressure, surface_pressure_policy=normalized_policy),
+        )
+        object.__setattr__(self, "surface_pressure_policy", normalized_policy)
+        if level_bounds is not None:
+            object.__setattr__(self, "level_bounds", level_bounds)
+
+    @property
+    def domain_metadata(self) -> dict[str, str | bool]:
+        return _domain_metadata_from_policy(self.surface_pressure_policy)
+
+    def annotate_domain_metadata(self, field: xr.DataArray) -> xr.DataArray:
+        return _annotate_with_domain_metadata(field, surface_pressure_policy=self.surface_pressure_policy)
 
     @classmethod
     def from_surface_pressure(
@@ -147,33 +307,13 @@ class TopographyAwareMeasure:
                 raise ValueError("'level_bounds' must match the vertical geometry stored on the integrator.")
 
         surface_pressure = _coerce_surface_pressure(surface_pressure, integrator)
-        level_edges = pressure_level_edges(level, bounds=resolved_level_bounds)
-        deepest_level_edge = float(level_edges.isel(level_edge=0))
         normalized_policy = _validate_surface_pressure_policy(surface_pressure_policy)
-
-        if normalized_policy == "raise":
-            too_deep = np.asarray(surface_pressure.values, dtype=float) > deepest_level_edge + float(pressure_tolerance)
-            if np.any(too_deep):
-                raise ValueError(
-                    "Surface pressure extends below the deepest model pressure interface; "
-                    "use surface_pressure_policy='clip' to truncate to the model domain."
-                )
-            effective_surface_pressure = surface_pressure
-        else:
-            effective_surface_pressure = xr.apply_ufunc(
-                np.minimum,
-                surface_pressure,
-                xr.full_like(surface_pressure, deepest_level_edge, dtype=float),
-            )
-
-        effective_surface_pressure = effective_surface_pressure.astype(float)
-        effective_surface_pressure.name = "ps_effective"
-        effective_surface_pressure.attrs.update(
-            {
-                "units": "Pa",
-                "long_name": "effective surface pressure used by the exact finite-volume measure",
-                "surface_pressure_policy": normalized_policy,
-            }
+        effective_surface_pressure = _expected_effective_surface_pressure(
+            surface_pressure,
+            integrator,
+            level_bounds=resolved_level_bounds,
+            pressure_tolerance=float(pressure_tolerance),
+            surface_pressure_policy=normalized_policy,
         )
 
         return cls(
@@ -230,7 +370,7 @@ class TopographyAwareMeasure:
                 "long_name": "topography-aware above-ground pressure thickness",
             }
         )
-        return above_ground_dp
+        return self.annotate_domain_metadata(above_ground_dp)
 
     @cached_property
     def cell_fraction(self) -> xr.DataArray:
@@ -243,7 +383,7 @@ class TopographyAwareMeasure:
                 "long_name": "fraction of each pressure layer that remains above ground",
             }
         )
-        return fraction
+        return self.annotate_domain_metadata(fraction)
 
     @cached_property
     def parcel_mass(self) -> xr.DataArray:
@@ -256,7 +396,7 @@ class TopographyAwareMeasure:
                 "long_name": "topography-aware parcel mass of each pressure cell",
             }
         )
-        return parcel_mass
+        return self.annotate_domain_metadata(parcel_mass)
 
     @cached_property
     def zonal_mass(self) -> xr.DataArray:
@@ -268,7 +408,7 @@ class TopographyAwareMeasure:
                 "long_name": "topography-aware zonal atmospheric mass on each level-latitude band",
             }
         )
-        return zonal_mass
+        return self.annotate_domain_metadata(zonal_mass)
 
     @cached_property
     def zonal_fraction(self) -> xr.DataArray:
@@ -281,7 +421,7 @@ class TopographyAwareMeasure:
                 "long_name": "zonal finite-volume coverage fraction of each level-latitude band",
             }
         )
-        return zonal_fraction
+        return self.annotate_domain_metadata(zonal_fraction)
 
     def integrate_full(self, field: xr.DataArray) -> xr.DataArray:
         field = normalize_field(field, "field")
@@ -303,7 +443,12 @@ def resolve_exact_measure(
     pressure_tolerance: float = 1.0e-6,
     diagnostic_name: str = "Exact Boer diagnostics",
 ) -> TopographyAwareMeasure:
-    """Resolve the default finite-volume measure for an exact diagnostic."""
+    """Resolve the finite-volume measure for an exact diagnostic.
+
+    When an explicit ``measure`` is supplied it remains authoritative; the optional
+    ``ps`` argument is used only to validate that the measure was built from the same
+    raw surface-pressure field.
+    """
 
     if measure is not None:
         _validate_measure_compatibility(

@@ -9,6 +9,7 @@ from mars_exact_lec.boer.conversions import C_K, C_K1, C_K2, C_Z, C_Z1, C_Z2
 from mars_exact_lec.boer.reservoirs import A, A1, A2, A_E, A_E1, A_E2, A_Z, A_Z1, A_Z2
 from mars_exact_lec.common.geopotential import reconstruct_hydrostatic_geopotential
 from mars_exact_lec.common.integrals import build_mass_integrator
+from mars_exact_lec.common.normalization import to_per_area
 from mars_exact_lec.common.topography_measure import TopographyAwareMeasure
 from mars_exact_lec.common.time_derivatives import time_derivative
 from mars_exact_lec.constants_mars import MARS
@@ -29,6 +30,16 @@ from .helpers import (
     surface_zonal_field,
     temperature_from_theta_values,
 )
+from .helpers_exact import build_flat_reference_case as build_shared_flat_reference_case
+
+
+_CK2_BOUNDARY_ATTRS = {
+    "ck2_horizontal_gradient_scheme": "segmented_finite_difference_v2",
+    "ck2_meridional_gradient_scheme": "segmented_coordinate_derivative_v2",
+    "ck2_boundary_treatment": "centered_interior__one_sided_open_boundary",
+    "ck2_singleton_segment_policy": "exclude_from_directional_zonal_average",
+    "ck2_derivative_mask": "theta_sharp_above_ground",
+}
 
 
 def _solver_for_case(ps, level, *, pressure_tolerance: float = 1.0e-6, max_iterations: int = 64) -> KoehlerReferenceState:
@@ -41,6 +52,11 @@ def _solver_for_case(ps, level, *, pressure_tolerance: float = 1.0e-6, max_itera
             pressure_tolerance=pressure_tolerance,
         ),
     )
+
+
+def _assert_ck2_boundary_attrs(term):
+    for key, value in _CK2_BOUNDARY_ATTRS.items():
+        assert term.attrs[key] == value
 
 
 def test_time_derivative_supports_datetime_coordinates():
@@ -494,6 +510,202 @@ def test_ck2_hydrostatic_reconstruction_ignores_below_ground_temperature_fill():
     np.testing.assert_allclose(base.values, perturbed.values)
 
 
+def test_ck2_is_invariant_under_longitude_cyclic_shift_with_wraparound_segment():
+    time, level, latitude, longitude = make_coords(ntime=3, nlon=8)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps_row = np.asarray([760.0, 755.0, 650.0, 650.0, 650.0, 650.0, 650.0, 770.0], dtype=float)
+    ps = surface_pressure(
+        time,
+        latitude,
+        longitude,
+        np.broadcast_to(ps_row[None, :], (latitude.size, longitude.size)),
+    )
+    theta = make_theta(pressure, ps)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    policy = surface_pressure_policy_for_case(ps, level)
+
+    geopotential_values = np.zeros((time.size, level.size, latitude.size, longitude.size), dtype=float)
+    lat_scale = np.linspace(1.0, 2.5, latitude.size, dtype=float)[:, None]
+    lon_pattern = np.asarray([0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, -3.0], dtype=float)[None, :]
+    geopotential_values[:, 0, :, :] = 200.0 + 25.0 * lat_scale * lon_pattern
+    geopotential_values[:, 1, :, :] = 120.0
+    geopotential_values[:, 2, :, :] = 80.0
+    geopotential = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        geopotential_values,
+        name="geopotential",
+        units="m2 s-2",
+    )
+
+    u = full_field(time, level, latitude, longitude, 12.0, name="u", units="m s-1")
+    v = full_field(time, level, latitude, longitude, 0.0, name="v", units="m s-1")
+    omega = full_field(time, level, latitude, longitude, 0.0, name="omega", units="Pa s-1")
+
+    reference = C_K2(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        geopotential=geopotential,
+        ps=ps,
+        surface_pressure_policy=policy,
+    )
+
+    ps_shifted = ps.roll(longitude=2, roll_coords=False)
+    geopotential_shifted = geopotential.roll(longitude=2, roll_coords=False)
+    theta_shifted = make_theta(pressure, ps_shifted)
+    shifted = C_K2(
+        u,
+        v,
+        omega,
+        theta_shifted,
+        integrator,
+        geopotential=geopotential_shifted,
+        ps=ps_shifted,
+        surface_pressure_policy=surface_pressure_policy_for_case(ps_shifted, level),
+    )
+
+    assert np.isfinite(reference.values).all()
+    assert np.isfinite(shifted.values).all()
+    assert np.any(np.abs(np.asarray(reference.values, dtype=float)) > 1.0e-12)
+    np.testing.assert_allclose(reference.values, shifted.values, rtol=0.0, atol=1.0e-12)
+
+
+def test_ck2_handles_singleton_and_two_point_longitude_segments_without_boundary_fill_dependence():
+    time, level, latitude, longitude = make_coords(ntime=3, nlat=2, nlon=8)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps_values = np.asarray(
+        [
+            [760.0, 650.0, 650.0, 650.0, 650.0, 650.0, 650.0, 650.0],
+            [650.0, 650.0, 760.0, 760.0, 650.0, 650.0, 650.0, 650.0],
+        ],
+        dtype=float,
+    )
+    ps = surface_pressure(time, latitude, longitude, ps_values)
+    theta = make_theta(pressure, ps)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    policy = surface_pressure_policy_for_case(ps, level)
+
+    geopotential_values = np.zeros((time.size, level.size, latitude.size, longitude.size), dtype=float)
+    geopotential_values[:, 0, 0, 0] = 100.0
+    geopotential_values[:, 0, 1, 2] = 10.0
+    geopotential_values[:, 0, 1, 3] = 20.0
+    geopotential_values[:, 1, :, :] = 120.0
+    geopotential_values[:, 2, :, :] = 80.0
+    geopotential = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        geopotential_values,
+        name="geopotential",
+        units="m2 s-2",
+    )
+    geopotential_singleton_perturbed = geopotential.copy(deep=True)
+    geopotential_singleton_perturbed.loc[
+        dict(level=level.values[0], latitude=latitude.values[0], longitude=longitude.values[0])
+    ] = 1.0e6
+
+    explicit_low = geopotential.where(theta > 0.0, -1.0e4)
+    explicit_high = geopotential.where(theta > 0.0, 1.0e6)
+    explicit_singleton = geopotential_singleton_perturbed.where(theta > 0.0, -1.0e4)
+
+    u = full_field(time, level, latitude, longitude, 15.0, name="u", units="m s-1")
+    v = full_field(time, level, latitude, longitude, 0.0, name="v", units="m s-1")
+    omega = full_field(time, level, latitude, longitude, 0.0, name="omega", units="Pa s-1")
+
+    low_fill = C_K2(u, v, omega, theta, integrator, geopotential=explicit_low, ps=ps, surface_pressure_policy=policy)
+    high_fill = C_K2(u, v, omega, theta, integrator, geopotential=explicit_high, ps=ps, surface_pressure_policy=policy)
+    singleton_perturbed = C_K2(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        geopotential=explicit_singleton,
+        ps=ps,
+        surface_pressure_policy=policy,
+    )
+
+    assert np.isfinite(low_fill.values).all()
+    assert np.isfinite(high_fill.values).all()
+    assert np.isfinite(singleton_perturbed.values).all()
+    assert np.any(np.abs(np.asarray(low_fill.values, dtype=float)) > 1.0e-12)
+    np.testing.assert_allclose(low_fill.values, high_fill.values, rtol=0.0, atol=1.0e-12)
+    np.testing.assert_allclose(low_fill.values, singleton_perturbed.values, rtol=1.0e-9, atol=1.0e-6)
+
+
+def test_ck2_meridional_fragmented_mask_is_stable_for_latitude_segment_boundaries():
+    time, level, latitude, longitude = make_coords(ntime=3, nlat=6, nlon=4)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps_by_latitude = np.asarray([650.0, 740.0, 760.0, 780.0, 650.0, 650.0], dtype=float)
+    ps = surface_pressure(
+        time,
+        latitude,
+        longitude,
+        np.broadcast_to(ps_by_latitude[:, None], (latitude.size, longitude.size)),
+    )
+    theta = make_theta(pressure, ps)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    policy = surface_pressure_policy_for_case(ps, level)
+
+    geopotential_values = np.zeros((time.size, level.size, latitude.size, longitude.size), dtype=float)
+    lat_profile = np.asarray([-3.0, -1.0, 0.5, 2.0, 3.0, 4.0], dtype=float)[:, None]
+    lon_profile = np.asarray([-1.5, -0.5, 0.5, 1.5], dtype=float)[None, :]
+    geopotential_values[:, 0, :, :] = 150.0 + 30.0 * lat_profile * lon_profile
+    geopotential_values[:, 1, :, :] = 120.0
+    geopotential_values[:, 2, :, :] = 80.0
+    geopotential = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        geopotential_values,
+        name="geopotential",
+        units="m2 s-2",
+    )
+
+    u = full_field(time, level, latitude, longitude, 0.0, name="u", units="m s-1")
+    v = full_field(time, level, latitude, longitude, 5.0, name="v", units="m s-1")
+    omega = full_field(time, level, latitude, longitude, 0.0, name="omega", units="Pa s-1")
+
+    reference = C_K2(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        geopotential=geopotential,
+        ps=ps,
+        surface_pressure_policy=policy,
+    )
+
+    ps_mirror = ps.copy(data=np.flip(ps.values, axis=1))
+    theta_mirror = make_theta(pressure, ps_mirror)
+    geopotential_mirror = geopotential.copy(data=np.flip(geopotential.values, axis=2))
+    v_mirror = v.copy(data=-np.flip(v.values, axis=2))
+    mirrored = C_K2(
+        u,
+        v_mirror,
+        omega,
+        theta_mirror,
+        integrator,
+        geopotential=geopotential_mirror,
+        ps=ps_mirror,
+        surface_pressure_policy=surface_pressure_policy_for_case(ps_mirror, level),
+    )
+
+    truncated_columns = np.count_nonzero(np.asarray(theta.isel(time=0, level=0).values, dtype=bool), axis=0)
+    assert np.any((truncated_columns > 0) & (truncated_columns < latitude.size))
+    assert np.isfinite(reference.values).all()
+    assert np.isfinite(mirrored.values).all()
+    np.testing.assert_allclose(reference.values, mirrored.values, rtol=0.0, atol=1.0e-12)
+
+
 def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
     time, level, latitude, longitude = reference_case_coords(ntime=3)
     pressure = pressure_field(time, level, latitude, longitude)
@@ -617,6 +829,339 @@ def test_flat_surface_topographic_terms_and_totals_reduce_to_phase2():
         0.0,
         atol=1.0e-12,
     )
+
+
+def test_flat_surface_limit_with_nonzero_constant_phis_still_zeroes_surface_terms():
+    case = build_shared_flat_reference_case(
+        ntime=3,
+        level_values=(900.0, 700.0, 500.0),
+        ps_value=1000.0,
+        phis_value=2000.0,
+        theta_profile=(210.0, 230.0, 250.0),
+    )
+    time = case["time"]
+    level = case["level"]
+    latitude = case["latitude"]
+    longitude = case["longitude"]
+    pressure = case["pressure"]
+    ps = case["ps"]
+    phis = case["phis"]
+    theta = case["theta_mask"]
+    temperature = case["temperature"]
+    integrator = case["integrator"]
+    measure = case["measure"]
+    solution = case["solution"]
+    omega = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(-0.3, 0.3, time.size)[:, None, None, None],
+        name="omega",
+        units="Pa s-1",
+    )
+    alpha = full_field(time, level, latitude, longitude, 0.8, name="alpha", units="m3 kg-1")
+
+    np.testing.assert_allclose(solution.pi_s.values, ps.values, rtol=0.0, atol=1.0e-10)
+    np.testing.assert_allclose(solution.pi_sZ.values, ps.values, rtol=0.0, atol=1.0e-10)
+    np.testing.assert_allclose(A_Z2(ps, phis, integrator, reference_state=solution, measure=measure).values, 0.0, rtol=0.0, atol=1.0e-10)
+    np.testing.assert_allclose(A_E2(ps, phis, integrator, reference_state=solution, measure=measure).values, 0.0, rtol=0.0, atol=1.0e-10)
+    np.testing.assert_allclose(A2(ps, phis, integrator, reference_state=solution, measure=measure).values, 0.0, rtol=0.0, atol=1.0e-10)
+    np.testing.assert_allclose(C_Z2(ps, phis, integrator, measure=measure).values, 0.0, rtol=0.0, atol=1.0e-10)
+    np.testing.assert_allclose(
+        A_Z(temperature, pressure, theta, integrator, reference_state=solution, measure=measure, ps=ps, phis=phis).values,
+        A_Z1(temperature, pressure, theta, integrator, reference_state=solution, measure=measure, ps=ps).values,
+        rtol=1.0e-12,
+        atol=1.0e-10,
+    )
+    np.testing.assert_allclose(
+        A_E(temperature, pressure, theta, integrator, reference_state=solution, measure=measure, ps=ps, phis=phis).values,
+        A_E1(temperature, pressure, theta, integrator, reference_state=solution, measure=measure, ps=ps).values,
+        rtol=1.0e-12,
+        atol=1.0e-10,
+    )
+    np.testing.assert_allclose(
+        A(temperature, pressure, theta, integrator, reference_state=solution, measure=measure, ps=ps, phis=phis).values,
+        A1(temperature, pressure, theta, integrator, reference_state=solution, measure=measure, ps=ps).values,
+        rtol=1.0e-12,
+        atol=1.0e-10,
+    )
+    np.testing.assert_allclose(
+        C_Z(omega, alpha, theta, integrator, measure=measure, ps=ps, phis=phis).values,
+        C_Z1(omega, alpha, theta, integrator, measure=measure, ps=ps).values,
+        rtol=1.0e-12,
+        atol=1.0e-10,
+    )
+
+
+def test_flat_surface_limit_ck2_vanishes_with_nonzero_zonal_mean_flow():
+    case = build_shared_flat_reference_case(
+        ntime=3,
+        level_values=(900.0, 700.0, 500.0),
+        ps_value=1000.0,
+        phis_value=2000.0,
+        theta_profile=(210.0, 230.0, 250.0),
+    )
+    time = case["time"]
+    level = case["level"]
+    latitude = case["latitude"]
+    longitude = case["longitude"]
+    pressure = case["pressure"]
+    ps = case["ps"]
+    phis = case["phis"]
+    theta = case["theta_mask"]
+    temperature = case["temperature"]
+    integrator = case["integrator"]
+    measure = case["measure"]
+    u = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(4.0, 16.0, time.size * level.size * latitude.size).reshape(
+            time.size,
+            level.size,
+            latitude.size,
+        )[..., None],
+        name="u",
+        units="m s-1",
+    )
+    v = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(-2.0, 5.0, time.size * level.size * latitude.size).reshape(
+            time.size,
+            level.size,
+            latitude.size,
+        )[..., None],
+        name="v",
+        units="m s-1",
+    )
+    omega = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(-0.2, 0.3, time.size * level.size * latitude.size).reshape(
+            time.size,
+            level.size,
+            latitude.size,
+        )[..., None],
+        name="omega",
+        units="Pa s-1",
+    )
+
+    ck2 = C_K2(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        measure=measure,
+        temperature=temperature,
+        pressure=pressure,
+        ps=ps,
+        phis=phis,
+    )
+    ck = C_K(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        measure=measure,
+        temperature=temperature,
+        pressure=pressure,
+        ps=ps,
+        phis=phis,
+    )
+    ck1 = C_K1(u, v, omega, theta, integrator, measure=measure, ps=ps)
+
+    np.testing.assert_allclose(ck2.values, 0.0, rtol=0.0, atol=1.0e-10)
+    np.testing.assert_allclose(ck.values, ck1.values, rtol=1.0e-12, atol=1.0e-10)
+
+
+def test_ck2_and_ck_carry_boundary_scheme_attrs():
+    case = build_shared_flat_reference_case(
+        ntime=3,
+        level_values=(900.0, 700.0, 500.0),
+        ps_value=1000.0,
+        phis_value=2000.0,
+        theta_profile=(210.0, 230.0, 250.0),
+    )
+    time = case["time"]
+    level = case["level"]
+    latitude = case["latitude"]
+    longitude = case["longitude"]
+    pressure = case["pressure"]
+    ps = case["ps"]
+    phis = case["phis"]
+    theta = case["theta_mask"]
+    temperature = case["temperature"]
+    integrator = case["integrator"]
+    measure = case["measure"]
+    u = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(4.0, 16.0, time.size * level.size * latitude.size).reshape(
+            time.size,
+            level.size,
+            latitude.size,
+        )[..., None],
+        name="u",
+        units="m s-1",
+    )
+    v = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(-2.0, 5.0, time.size * level.size * latitude.size).reshape(
+            time.size,
+            level.size,
+            latitude.size,
+        )[..., None],
+        name="v",
+        units="m s-1",
+    )
+    omega = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(-0.2, 0.3, time.size * level.size * latitude.size).reshape(
+            time.size,
+            level.size,
+            latitude.size,
+        )[..., None],
+        name="omega",
+        units="Pa s-1",
+    )
+
+    ck2 = C_K2(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        measure=measure,
+        temperature=temperature,
+        pressure=pressure,
+        ps=ps,
+        phis=phis,
+    )
+    ck = C_K(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        measure=measure,
+        temperature=temperature,
+        pressure=pressure,
+        ps=ps,
+        phis=phis,
+    )
+
+    _assert_ck2_boundary_attrs(ck2)
+    _assert_ck2_boundary_attrs(ck)
+
+
+def test_ck2_per_area_preserves_boundary_scheme_attrs():
+    case = build_shared_flat_reference_case(
+        ntime=3,
+        level_values=(900.0, 700.0, 500.0),
+        ps_value=1000.0,
+        phis_value=2000.0,
+        theta_profile=(210.0, 230.0, 250.0),
+    )
+    time = case["time"]
+    level = case["level"]
+    latitude = case["latitude"]
+    longitude = case["longitude"]
+    pressure = case["pressure"]
+    ps = case["ps"]
+    phis = case["phis"]
+    theta = case["theta_mask"]
+    temperature = case["temperature"]
+    integrator = case["integrator"]
+    measure = case["measure"]
+    u = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(4.0, 16.0, time.size * level.size * latitude.size).reshape(
+            time.size,
+            level.size,
+            latitude.size,
+        )[..., None],
+        name="u",
+        units="m s-1",
+    )
+    v = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(-2.0, 5.0, time.size * level.size * latitude.size).reshape(
+            time.size,
+            level.size,
+            latitude.size,
+        )[..., None],
+        name="v",
+        units="m s-1",
+    )
+    omega = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(-0.2, 0.3, time.size * level.size * latitude.size).reshape(
+            time.size,
+            level.size,
+            latitude.size,
+        )[..., None],
+        name="omega",
+        units="Pa s-1",
+    )
+
+    ck2 = C_K2(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        measure=measure,
+        temperature=temperature,
+        pressure=pressure,
+        ps=ps,
+        phis=phis,
+    )
+    ck = C_K(
+        u,
+        v,
+        omega,
+        theta,
+        integrator,
+        measure=measure,
+        temperature=temperature,
+        pressure=pressure,
+        ps=ps,
+        phis=phis,
+    )
+
+    ck2_per_area = to_per_area(ck2)
+    ck_per_area = to_per_area(ck)
+
+    _assert_ck2_boundary_attrs(ck2_per_area)
+    _assert_ck2_boundary_attrs(ck_per_area)
+    assert ck2_per_area.attrs["units"] == "W m-2"
+    assert ck_per_area.attrs["units"] == "W m-2"
 
 
 def test_total_exact_az_budget_has_smaller_residual_than_body_only_budget():
@@ -745,6 +1290,9 @@ def test_measure_aware_surface_energy_terms_use_effective_surface_pressure_and_p
 
     np.testing.assert_allclose((az2 + ae2).values, a2.values)
     np.testing.assert_allclose(a2.values, expected_a2.values)
+    assert az2.attrs["surface_pressure_policy"] == "clip"
+    assert ae2.attrs["domain"] == "truncated_to_model_pressure_domain"
+    assert a2.attrs["not_exact_full_atmosphere"] is True
 
 
 def test_clip_policy_auto_measure_surface_terms_match_explicit_measure():
@@ -807,6 +1355,9 @@ def test_measure_aware_cz2_differentiates_effective_surface_pressure_under_clip_
     expected = -integrator.integrate_surface(time_derivative(measure.effective_surface_pressure) * phis)
 
     np.testing.assert_allclose(clipped.values, expected.values)
+    assert clipped.attrs["surface_pressure_policy"] == "clip"
+    assert clipped.attrs["domain"] == "truncated_to_model_pressure_domain"
+    assert clipped.attrs["not_exact_full_atmosphere"] is True
     with pytest.raises(ValueError, match="Surface pressure extends below the deepest model pressure interface"):
         C_Z2(ps, phis, integrator)
 

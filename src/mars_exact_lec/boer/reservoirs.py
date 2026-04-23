@@ -128,12 +128,15 @@ def _annotate_quantity(
     *,
     units: str,
     base_quantity: str,
+    measure: TopographyAwareMeasure | None = None,
     surface_term_included: bool | None = None,
     long_name: str | None = None,
 ) -> xr.DataArray:
     result.attrs["units"] = units
     result.attrs["normalization"] = "global_integral"
     result.attrs["base_quantity"] = base_quantity
+    if measure is not None:
+        result.attrs.update(measure.domain_metadata)
     if surface_term_included is not None:
         result.attrs["surface_term_included"] = surface_term_included
     if long_name is not None:
@@ -461,7 +464,7 @@ def total_horizontal_ke(
     integrand = 0.5 * weight * (u**2 + v**2)
     result = _integrate_full_mass_aware(integrand, weight, integrator, measure)
     result.name = "total_horizontal_ke"
-    return _annotate_quantity(result, units="J", base_quantity="energy")
+    return _annotate_quantity(result, units="J", base_quantity="energy", measure=measure)
 
 
 def kinetic_energy_zonal(
@@ -495,7 +498,7 @@ def kinetic_energy_zonal(
     integrand = 0.5 * coverage * (u_r**2 + v_r**2)
     result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "K_Z"
-    return _annotate_quantity(result, units="J", base_quantity="energy")
+    return _annotate_quantity(result, units="J", base_quantity="energy", measure=measure)
 
 
 def kinetic_energy_eddy(
@@ -530,7 +533,7 @@ def kinetic_energy_eddy(
     integrand = 0.5 * zonal_mean(weight * (u_star**2 + v_star**2))
     result = _integrate_zonal_mass_aware(integrand, coverage, integrator, measure)
     result.name = "K_E"
-    return _annotate_quantity(result, units="J", base_quantity="energy")
+    return _annotate_quantity(result, units="J", base_quantity="energy", measure=measure)
 
 
 def available_potential_energy_zonal_part1(
@@ -599,6 +602,7 @@ def available_potential_energy_zonal_part1(
         result,
         units="J",
         base_quantity="energy",
+        measure=measure,
         long_name="zonal exact available potential energy body term",
         surface_term_included=False,
     )
@@ -687,6 +691,7 @@ def available_potential_energy_eddy_part1(
         result,
         units="J",
         base_quantity="energy",
+        measure=measure,
         long_name="eddy exact available potential energy body term",
         surface_term_included=False,
     )
@@ -755,6 +760,7 @@ def available_potential_energy_part1(
         result,
         units="J",
         base_quantity="energy",
+        measure=measure,
         long_name="exact available potential energy body term",
         surface_term_included=False,
     )
@@ -798,6 +804,7 @@ def available_potential_energy_zonal_part2(
         result,
         units="J",
         base_quantity="energy",
+        measure=measure,
         long_name="zonal exact available potential energy topographic term",
         surface_term_included=True,
     )
@@ -849,6 +856,7 @@ def available_potential_energy_eddy_part2(
         result,
         units="J",
         base_quantity="energy",
+        measure=measure,
         long_name="eddy exact available potential energy topographic term",
         surface_term_included=True,
     )
@@ -892,6 +900,7 @@ def available_potential_energy_part2(
         result,
         units="J",
         base_quantity="energy",
+        measure=measure,
         long_name="exact available potential energy topographic term",
         surface_term_included=True,
     )
@@ -947,7 +956,7 @@ def available_potential_energy_zonal(
         pi_sZ=pi_sZ,
     )
     result.name = "A_Z"
-    return _annotate_quantity(result, units="J", base_quantity="energy", surface_term_included=True)
+    return _annotate_quantity(result, units="J", base_quantity="energy", measure=measure, surface_term_included=True)
 
 
 def available_potential_energy_eddy(
@@ -1006,7 +1015,7 @@ def available_potential_energy_eddy(
         pi_sZ=pi_sZ,
     )
     result.name = "A_E"
-    return _annotate_quantity(result, units="J", base_quantity="energy", surface_term_included=True)
+    return _annotate_quantity(result, units="J", base_quantity="energy", measure=measure, surface_term_included=True)
 
 
 def available_potential_energy(
@@ -1059,7 +1068,7 @@ def available_potential_energy(
         pi_s=pi_s,
     )
     result.name = "A"
-    return _annotate_quantity(result, units="J", base_quantity="energy", surface_term_included=True)
+    return _annotate_quantity(result, units="J", base_quantity="energy", measure=measure, surface_term_included=True)
 
 
 total_available_potential_energy_part1 = available_potential_energy_part1

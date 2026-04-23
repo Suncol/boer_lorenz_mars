@@ -93,3 +93,33 @@ def test_topography_measure_surface_pressure_policy_raise_and_clip():
 
     np.testing.assert_allclose(clipped.effective_surface_pressure.values, 1000.0)
     assert clipped.surface_pressure_policy == "clip"
+    assert clipped.surface_pressure.attrs["domain"] == "truncated_to_model_pressure_domain"
+    assert clipped.effective_surface_pressure.attrs["not_exact_full_atmosphere"] is True
+    assert clipped.above_ground_dp.attrs["surface_pressure_policy"] == "clip"
+    assert clipped.cell_fraction.attrs["domain"] == "truncated_to_model_pressure_domain"
+    assert clipped.parcel_mass.attrs["not_exact_full_atmosphere"] is True
+    assert clipped.zonal_mass.attrs["surface_pressure_policy"] == "clip"
+
+    raised = TopographyAwareMeasure.from_surface_pressure(
+        level,
+        surface_pressure(time, latitude, longitude, 900.0),
+        integrator,
+        surface_pressure_policy="raise",
+    )
+    assert raised.effective_surface_pressure.attrs["domain"] == "full_model_pressure_domain"
+    assert raised.effective_surface_pressure.attrs["not_exact_full_atmosphere"] is False
+
+
+def test_topography_measure_rejects_effective_surface_pressure_inconsistent_with_policy():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[800.0, 400.0], nlat=2, nlon=4)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 1100.0)
+    inconsistent_effective = surface_pressure(time, latitude, longitude, 950.0)
+
+    with pytest.raises(ValueError, match="max \\|Δps_effective\\|"):
+        TopographyAwareMeasure(
+            integrator=integrator,
+            surface_pressure=ps,
+            effective_surface_pressure=inconsistent_effective,
+            surface_pressure_policy="clip",
+        )

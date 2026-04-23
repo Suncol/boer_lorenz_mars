@@ -1096,6 +1096,9 @@ class KoehlerReferenceState:
             "longitude": potential_temperature.coords["longitude"].values,
         }
 
+        def _annotate_domain(field: xr.DataArray) -> xr.DataArray:
+            return measure.annotate_domain_metadata(field)
+
         return ReferenceStateSolution(
             theta_reference=xr.DataArray(
                 full_solution["theta_reference"],
@@ -1132,45 +1135,55 @@ class KoehlerReferenceState:
                 name="reference_interface_geopotential",
                 attrs={"units": "m2 s-2", "long_name": "reference-state geopotential interfaces"},
             ),
-            total_mass=xr.DataArray(
-                full_solution["total_mass"],
-                dims=("time",),
-                coords={"time": potential_temperature.coords["time"].values},
-                name="total_mass",
-                attrs={"units": "kg"},
+            total_mass=_annotate_domain(
+                xr.DataArray(
+                    full_solution["total_mass"],
+                    dims=("time",),
+                    coords={"time": potential_temperature.coords["time"].values},
+                    name="total_mass",
+                    attrs={"units": "kg"},
+                )
             ),
-            reference_surface_pressure=xr.DataArray(
-                full_solution["reference_surface_pressure"],
-                dims=("time",),
-                coords={"time": potential_temperature.coords["time"].values},
-                name="reference_surface_pressure",
-                attrs={"units": "Pa", "long_name": "area-weighted mean reference-state surface pressure"},
+            reference_surface_pressure=_annotate_domain(
+                xr.DataArray(
+                    full_solution["reference_surface_pressure"],
+                    dims=("time",),
+                    coords={"time": potential_temperature.coords["time"].values},
+                    name="reference_surface_pressure",
+                    attrs={"units": "Pa", "long_name": "area-weighted mean reference-state surface pressure"},
+                )
             ),
-            reference_bottom_pressure=xr.DataArray(
-                full_solution["reference_bottom_pressure"],
-                dims=("time",),
-                coords={"time": potential_temperature.coords["time"].values},
-                name="reference_bottom_pressure",
-                attrs={"units": "Pa", "long_name": "deepest reference-state surface pressure"},
+            reference_bottom_pressure=_annotate_domain(
+                xr.DataArray(
+                    full_solution["reference_bottom_pressure"],
+                    dims=("time",),
+                    coords={"time": potential_temperature.coords["time"].values},
+                    name="reference_bottom_pressure",
+                    attrs={"units": "Pa", "long_name": "deepest reference-state surface pressure"},
+                )
             ),
             reference_top_pressure=reference_top_pressure.rename("reference_top_pressure"),
-            ps_effective=measure.effective_surface_pressure.rename("ps_effective"),
-            pi_s=xr.DataArray(
-                full_solution["pi_s"],
-                dims=("time", "latitude", "longitude"),
-                coords=surface_coords,
-                name="pi_s",
-                attrs={"units": "Pa", "long_name": "reference-state surface pressure"},
+            ps_effective=_annotate_domain(measure.effective_surface_pressure.rename("ps_effective")),
+            pi_s=_annotate_domain(
+                xr.DataArray(
+                    full_solution["pi_s"],
+                    dims=("time", "latitude", "longitude"),
+                    coords=surface_coords,
+                    name="pi_s",
+                    attrs={"units": "Pa", "long_name": "reference-state surface pressure"},
+                )
             ),
-            pi_sZ=xr.DataArray(
-                zonal_solution["pi_s"],
-                dims=("time", "latitude", "longitude"),
-                coords=surface_coords,
-                name="pi_sZ",
-                attrs={
-                    "units": "Pa",
-                    "long_name": "zonal-thermodynamic reference-state surface pressure on actual topography",
-                },
+            pi_sZ=_annotate_domain(
+                xr.DataArray(
+                    zonal_solution["pi_s"],
+                    dims=("time", "latitude", "longitude"),
+                    coords=surface_coords,
+                    name="pi_sZ",
+                    attrs={
+                        "units": "Pa",
+                        "long_name": "zonal-thermodynamic reference-state surface pressure on actual topography",
+                    },
+                )
             ),
             iterations=xr.DataArray(
                 full_solution["iterations"],

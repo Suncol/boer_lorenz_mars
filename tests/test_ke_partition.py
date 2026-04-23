@@ -146,6 +146,118 @@ def test_ke_auto_measure_matches_explicit_measure():
     np.testing.assert_allclose(auto.values, explicit.values)
 
 
+def test_explicit_measure_with_matching_ps_matches_measure_only_path():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[800.0, 400.0], nlat=2, nlon=4)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps = surface_pressure(
+        time,
+        latitude,
+        longitude,
+        np.asarray(
+            [
+                [700.0, 650.0, 500.0, 250.0],
+                [700.0, 650.0, 500.0, 250.0],
+            ]
+        ),
+    )
+    theta = make_theta(pressure, ps)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    measure = TopographyAwareMeasure.from_surface_pressure(level, ps, integrator)
+    u = full_field(time, level, latitude, longitude, 2.0, name="u", units="m s-1")
+    v = full_field(time, level, latitude, longitude, 1.0, name="v", units="m s-1")
+
+    with_ps = total_horizontal_ke(u, v, theta, integrator, measure=measure, ps=ps)
+    measure_only = total_horizontal_ke(u, v, theta, integrator, measure=measure)
+
+    np.testing.assert_allclose(with_ps.values, measure_only.values)
+
+
+def test_explicit_measure_rejects_different_raw_surface_pressure_field():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[800.0, 400.0], nlat=2, nlon=4)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps_measure = surface_pressure(
+        time,
+        latitude,
+        longitude,
+        np.asarray(
+            [
+                [700.0, 650.0, 500.0, 250.0],
+                [700.0, 650.0, 500.0, 250.0],
+            ]
+        ),
+    )
+    ps_runtime = surface_pressure(
+        time,
+        latitude,
+        longitude,
+        np.asarray(
+            [
+                [700.0, 640.0, 500.0, 250.0],
+                [700.0, 640.0, 500.0, 250.0],
+            ]
+        ),
+    )
+    theta = make_theta(pressure, ps_runtime)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    measure = TopographyAwareMeasure.from_surface_pressure(level, ps_measure, integrator)
+    u = full_field(time, level, latitude, longitude, 2.0, name="u", units="m s-1")
+    v = full_field(time, level, latitude, longitude, 1.0, name="v", units="m s-1")
+
+    with pytest.raises(ValueError, match="different surface pressure field.*max \\|Δps\\|"):
+        total_horizontal_ke(u, v, theta, integrator, measure=measure, ps=ps_runtime)
+
+
+def test_clip_policy_rejects_raw_ps_mismatch_even_when_effective_surface_pressure_matches():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[800.0, 400.0], nlat=2, nlon=4)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps_measure = surface_pressure(time, latitude, longitude, 1100.0)
+    ps_runtime = surface_pressure(time, latitude, longitude, 1050.0)
+    theta = make_theta(pressure, ps_runtime)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    measure = TopographyAwareMeasure.from_surface_pressure(
+        level,
+        ps_measure,
+        integrator,
+        surface_pressure_policy="clip",
+    )
+    u = full_field(time, level, latitude, longitude, 2.0, name="u", units="m s-1")
+    v = full_field(time, level, latitude, longitude, 1.0, name="v", units="m s-1")
+
+    np.testing.assert_allclose(measure.effective_surface_pressure.values, 1000.0)
+    with pytest.raises(ValueError, match="different surface pressure field.*max \\|Δps\\|"):
+        total_horizontal_ke(
+            u,
+            v,
+            theta,
+            integrator,
+            measure=measure,
+            ps=ps_runtime,
+            surface_pressure_policy="clip",
+        )
+
+
+def test_ke_outputs_expose_pressure_domain_metadata_for_raise_and_clip():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[800.0, 400.0], nlat=2, nlon=4)
+    pressure = pressure_field(time, level, latitude, longitude)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    u = full_field(time, level, latitude, longitude, 2.0, name="u", units="m s-1")
+    v = full_field(time, level, latitude, longitude, 1.0, name="v", units="m s-1")
+
+    ps_raise = surface_pressure(time, latitude, longitude, 900.0)
+    theta_raise = make_theta(pressure, ps_raise)
+    kz_raise = kinetic_energy_zonal(u, v, theta_raise, integrator, ps=ps_raise, surface_pressure_policy="raise")
+    assert kz_raise.attrs["surface_pressure_policy"] == "raise"
+    assert kz_raise.attrs["domain"] == "full_model_pressure_domain"
+    assert kz_raise.attrs["not_exact_full_atmosphere"] is False
+
+    ps_clip = surface_pressure(time, latitude, longitude, 1100.0)
+    theta_clip = make_theta(pressure, ps_clip)
+    kz_clip = kinetic_energy_zonal(u, v, theta_clip, integrator, ps=ps_clip, surface_pressure_policy="clip")
+    assert kz_clip.attrs["surface_pressure_policy"] == "clip"
+    assert kz_clip.attrs["domain"] == "truncated_to_model_pressure_domain"
+    assert kz_clip.attrs["not_exact_full_atmosphere"] is True
+
+
 def test_ke_partition_requires_ps_or_explicit_measure():
     time, level, latitude, longitude = make_coords()
     pressure = pressure_field(time, level, latitude, longitude)

@@ -243,6 +243,22 @@ def test_conversion_auto_measure_reuses_integrator_level_bounds():
     np.testing.assert_allclose(auto.values, explicit.values)
 
 
+def test_conversion_outputs_expose_clip_domain_metadata():
+    time, level, latitude, longitude = make_coords(ntime=3, level_values=[800.0, 400.0], nlat=2, nlon=4)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 1100.0)
+    theta = make_theta(pressure, ps)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    omega = full_field(time, level, latitude, longitude, 0.2, name="omega", units="Pa s-1")
+    alpha = full_field(time, level, latitude, longitude, 0.8, name="alpha", units="m3 kg-1")
+
+    ce = conversion_eddy_ape_to_ke(omega, alpha, theta, integrator, ps=ps, surface_pressure_policy="clip")
+
+    assert ce.attrs["surface_pressure_policy"] == "clip"
+    assert ce.attrs["domain"] == "truncated_to_model_pressure_domain"
+    assert ce.attrs["not_exact_full_atmosphere"] is True
+
+
 def test_flat_surface_theta_and_zonal_mean_reduce_cleanly():
     time, level, latitude, longitude = make_coords()
     pressure = pressure_field(time, level, latitude, longitude)
