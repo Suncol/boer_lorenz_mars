@@ -75,6 +75,9 @@ def pressure_level_edges(level: xr.DataArray, *, bounds: xr.DataArray | None = N
         values = np.asarray(resolved_bounds.values, dtype=float)
         upper = np.maximum(values[:, 0], values[:, 1])
         lower = np.minimum(values[:, 0], values[:, 1])
+        level_values = np.asarray(level.values, dtype=float)
+        if np.any((level_values > upper) | (level_values < lower)):
+            raise ValueError("Each pressure level must lie inside its explicit pressure bounds.")
         if values.shape[0] > 1 and not np.allclose(lower[:-1], upper[1:]):
             raise ValueError("Pressure level bounds must define contiguous interfaces.")
 

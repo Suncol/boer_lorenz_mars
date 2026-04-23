@@ -304,6 +304,23 @@ def _pressure_like(template: xr.DataArray) -> xr.DataArray:
     return pressure.broadcast_like(template)
 
 
+def _require_pressure_coordinate_field(pressure: xr.DataArray, template: xr.DataArray, name: str = "pressure") -> xr.DataArray:
+    pressure = normalize_field(pressure, name)
+    ensure_matching_coordinates(template, [pressure])
+    canonical = _pressure_like(template)
+    if not np.allclose(
+        np.asarray(pressure.values, dtype=float),
+        np.asarray(canonical.values, dtype=float),
+        equal_nan=True,
+    ):
+        raise ValueError(
+            f"{name!r} must equal the pressure-coordinate level broadcast on the canonical grid."
+        )
+    canonical.name = pressure.name
+    canonical.attrs.update(pressure.attrs)
+    return canonical
+
+
 def _resolve_efficiency_factor(
     reference_state: Any,
     explicit_efficiency: Any,
@@ -553,7 +570,7 @@ def available_potential_energy_zonal_part1(
     """Return ``A_Z1 = ∫_M c_p Θ N_Z [T]_R dm`` in Joules."""
 
     temperature = normalize_field(temperature, "temperature")
-    pressure = normalize_field(pressure, "pressure")
+    pressure = _require_pressure_coordinate_field(pressure, temperature)
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(temperature, [pressure, theta])
     measure = _resolved_measure(
@@ -627,7 +644,7 @@ def available_potential_energy_eddy_part1(
     """Return ``A_E1 = ∫_M c_p Θ (N - N_Z) T dm`` in Joules."""
 
     temperature = normalize_field(temperature, "temperature")
-    pressure = normalize_field(pressure, "pressure")
+    pressure = _require_pressure_coordinate_field(pressure, temperature)
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(temperature, [pressure, theta])
     measure = _resolved_measure(
@@ -714,7 +731,7 @@ def available_potential_energy_part1(
     """Return ``A_1 = ∫_M c_p Θ N T dm`` in Joules."""
 
     temperature = normalize_field(temperature, "temperature")
-    pressure = normalize_field(pressure, "pressure")
+    pressure = _require_pressure_coordinate_field(pressure, temperature)
     theta = normalize_field(theta, "theta")
     ensure_matching_coordinates(temperature, [pressure, theta])
     measure = _resolved_measure(

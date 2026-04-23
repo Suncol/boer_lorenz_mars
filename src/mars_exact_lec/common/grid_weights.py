@@ -10,6 +10,9 @@ from .._validation import normalize_coordinate
 from ..constants_mars import MARS
 
 
+_BOUNDS_TOL = 1.0e-6
+
+
 def _candidate_bounds_names(coord_name: str) -> tuple[str, ...]:
     return (
         f"{coord_name}_bounds",
@@ -155,6 +158,19 @@ def latitude_bounds(latitude: xr.DataArray, *, bounds: xr.DataArray | None = Non
         values = np.asarray(resolved_bounds.values, dtype=float)
         lower = np.clip(np.minimum(values[:, 0], values[:, 1]), -90.0, 90.0)
         upper = np.clip(np.maximum(values[:, 0], values[:, 1]), -90.0, 90.0)
+        order = np.argsort(lower, kind="mergesort")
+        lower_sorted = lower[order]
+        upper_sorted = upper[order]
+        if not np.isclose(lower_sorted[0], -90.0, atol=_BOUNDS_TOL) or not np.isclose(
+            upper_sorted[-1],
+            90.0,
+            atol=_BOUNDS_TOL,
+        ):
+            raise ValueError("Explicit latitude bounds must tile the full sphere from -90 to 90 degrees.")
+        if np.any((upper_sorted - lower_sorted) <= 0.0):
+            raise ValueError("Explicit latitude bounds must define positive-width latitude bands.")
+        if lower_sorted.size > 1 and not np.allclose(upper_sorted[:-1], lower_sorted[1:], atol=_BOUNDS_TOL):
+            raise ValueError("Explicit latitude bounds must be contiguous and non-overlapping.")
         return xr.DataArray(
             np.column_stack([lower, upper]),
             dims=("latitude", "bounds"),
@@ -192,6 +208,13 @@ def infer_grid(latitude: xr.DataArray) -> str:
     values = np.asarray(latitude.values, dtype=float)
     diffs = np.diff(values)
     if np.allclose(diffs, diffs[0], atol=5e-8):
+        edges = np.empty(values.size + 1, dtype=float)
+        edges[1:-1] = 0.5 * (values[:-1] + values[1:])
+        edges[0] = values[0] + 0.5 * (values[0] - values[1])
+        edges[-1] = values[-1] + 0.5 * (values[-1] - values[-2])
+        south, north = (edges[-1], edges[0]) if edges[0] > edges[-1] else (edges[0], edges[-1])
+        if not np.isclose(south, -90.0, atol=5e-8) or not np.isclose(north, 90.0, atol=5e-8):
+            raise ValueError("Latitude grid is evenly spaced but does not tile the full sphere.")
         return "regular"
 
     equal_area_reference = _equal_area_regular_latitude_values(values.size)

@@ -48,6 +48,19 @@ def test_four_box_storage_tendencies_produce_power_units():
     assert storage.attrs["not_exact_full_atmosphere"] is False
 
 
+def test_four_box_storage_tendencies_preserve_per_area_normalization():
+    storage = four_box_storage_tendencies(
+        _series("A_Z", [0.0, 1.0, 2.0], "J m-2"),
+        _series("A_E", [0.0, 1.5, 3.0], "J m-2"),
+        _series("K_Z", [0.0, -1.0, -2.0], "J m-2"),
+        _series("K_E", [0.0, 0.5, 1.0], "J m-2"),
+    )
+
+    assert storage["dA_Z_dt"].attrs["units"] == "W m-2"
+    assert storage["dA_Z_dt"].attrs["normalization"] == "planetary_mean_per_area"
+    assert storage.attrs["normalization"] == "planetary_mean_per_area"
+
+
 def test_four_box_residual_generation_and_dissipation_follow_budget_identities():
     A_Z = _series("A_Z", [0.0, 3600.0, 7200.0], "J")
     A_E = _series("A_E", [0.0, 7200.0, 14400.0], "J")
@@ -68,6 +81,30 @@ def test_four_box_residual_generation_and_dissipation_follow_budget_identities()
     assert diagnostics["F_E"].attrs["normalization"] == "global_integral"
     assert diagnostics["G_Z"].attrs["domain"] == "full_model_pressure_domain"
     assert diagnostics.attrs["surface_pressure_policy"] == "raise"
+
+
+def test_four_box_storage_tendencies_reject_time_coordinate_mismatch():
+    a_z = _series("A_Z", [0.0, 3600.0, 7200.0], "J")
+    a_e = _series("A_E", [0.0, 7200.0, 14400.0], "J")
+    k_z = _series("K_Z", [0.0, -3600.0, -7200.0], "J")
+    k_e = _series("K_E", [0.0, 1800.0, 3600.0], "J").assign_coords(time=_time_coord() + 10.0)
+
+    with pytest.raises(ValueError, match="same time coordinate"):
+        four_box_storage_tendencies(a_z, a_e, k_z, k_e)
+
+
+def test_four_box_residual_generation_and_dissipation_reject_normalization_mismatch():
+    a_z = _series("A_Z", [0.0, 3600.0, 7200.0], "J")
+    a_e = _series("A_E", [0.0, 7200.0, 14400.0], "J")
+    k_z = _series("K_Z", [0.0, -3600.0, -7200.0], "J")
+    k_e = _series("K_E", [0.0, 1800.0, 3600.0], "J")
+    c_z = _series("C_Z", [2.0, 2.0, 2.0], "W m-2")
+    c_a = _series("C_A", [3.0, 3.0, 3.0], "W m-2")
+    c_e = _series("C_E", [5.0, 5.0, 5.0], "W m-2")
+    c_k = _series("C_K", [7.0, 7.0, 7.0], "W m-2")
+
+    with pytest.raises(ValueError, match="same normalization"):
+        four_box_residual_generation_dissipation(a_z, a_e, k_z, k_e, c_z, c_a, c_e, c_k)
 
 
 def test_four_box_residual_generation_and_dissipation_close_total_budget_identity():

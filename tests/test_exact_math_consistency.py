@@ -152,3 +152,42 @@ def test_no_eddy_limit_zeroes_ke_ce_ca_ck1_on_same_case():
     np.testing.assert_allclose(ce.values, 0.0, rtol=0.0, atol=1.0e-12)
     np.testing.assert_allclose(ca.values, 0.0, rtol=0.0, atol=1.0e-12)
     np.testing.assert_allclose(ck1.values, 0.0, rtol=0.0, atol=1.0e-12)
+
+
+def test_exact_ape_body_terms_reject_non_coordinate_pressure_fields():
+    case = build_asymmetric_exact_case(include_reference=True, ntime=1)
+    pressure = case["pressure"].copy(deep=True)
+    pressure.loc[dict(longitude=pressure.coords["longitude"].values[0])] = (
+        pressure.sel(longitude=pressure.coords["longitude"].values[0]) + 5.0
+    )
+
+    with pytest.raises(ValueError, match="pressure-coordinate level broadcast"):
+        A1(
+            case["temperature"],
+            pressure,
+            case["theta_mask"],
+            case["integrator"],
+            measure=case["measure"],
+            ps=case["ps"],
+            reference_state=case["solution"],
+        )
+    with pytest.raises(ValueError, match="pressure-coordinate level broadcast"):
+        A_Z1(
+            case["temperature"],
+            pressure,
+            case["theta_mask"],
+            case["integrator"],
+            measure=case["measure"],
+            ps=case["ps"],
+            reference_state=case["solution"],
+        )
+    with pytest.raises(ValueError, match="pressure-coordinate level broadcast"):
+        A_E1(
+            case["temperature"],
+            pressure,
+            case["theta_mask"],
+            case["integrator"],
+            measure=case["measure"],
+            ps=case["ps"],
+            reference_state=case["solution"],
+        )

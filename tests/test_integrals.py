@@ -73,6 +73,24 @@ def test_pressure_level_edges_and_delta_p_use_explicit_bounds_when_available():
     np.testing.assert_allclose(integrator.delta_p.values, np.asarray([280.0, 280.0, 360.0]))
 
 
+def test_pressure_level_edges_reject_bounds_that_do_not_contain_the_pressure_level():
+    level = xr.DataArray(
+        np.asarray([800.0, 400.0]),
+        dims=("level",),
+        coords={"level": [800.0, 400.0]},
+        attrs={"units": "Pa", "axis": "Z", "standard_name": "pressure"},
+        name="level",
+    )
+    bad_bounds = xr.DataArray(
+        np.asarray([[1000.0, 900.0], [900.0, 100.0]]),
+        dims=("level", "bounds"),
+        coords={"level": level.values, "bounds": [0, 1]},
+    )
+
+    with pytest.raises(ValueError, match="must lie inside"):
+        pressure_level_edges(level, bounds=bad_bounds)
+
+
 def test_integrate_surface_of_one_matches_global_area_over_g():
     time, _, latitude, longitude = make_coords()
     integrator = build_mass_integrator(
