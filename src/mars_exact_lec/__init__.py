@@ -1,9 +1,9 @@
 """Mars exact Lorenz energy-cycle diagnostics.
 
-Phase 1 provides the shared topography-aware foundation used by the exact
+This package provides shared topography-aware utilities for the exact
 Lorenz/Boer branch: Mars constants, pressure-mask helpers, geometric weights,
-mass integrators, representative zonal operators, and the first kinetic-energy
-reservoir/conversion terms that do not depend on a reference state.
+mass integrators, representative zonal operators, reference-state utilities,
+reservoir diagnostics, conversion diagnostics, and closure helpers.
 """
 
 from .constants_mars import MARS, MarsConstants, Omega, Rd, a, cp, g, kappa, p00

@@ -220,7 +220,7 @@ def _derive_longitude_bounds(longitude: xr.DataArray) -> xr.DataArray:
     widths = np.diff(edges)
     if np.any(widths <= 0.0) or not np.isclose(widths.sum(), 360.0, atol=1e-6):
         raise ValueError(
-            "Phase-1 Mars exact diagnostics only support full global longitude rings."
+            "Mars exact diagnostics require full global longitude rings."
         )
 
     return xr.DataArray(

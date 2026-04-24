@@ -1,4 +1,4 @@
-"""Internal validation helpers shared by the phase-1 Mars exact package."""
+"""Internal validation helpers shared by Mars exact diagnostics."""
 
 from __future__ import annotations
 
@@ -93,7 +93,7 @@ def _validate_longitude(
 
 
 def normalize_field(field: xr.DataArray, name: str) -> xr.DataArray:
-    """Validate and transpose a 4D field to the canonical phase-1 dimension order."""
+    """Validate and transpose a 4D field to the canonical field dimension order."""
 
     field = require_dataarray(field, name)
     if set(field.dims) != set(FIELD_DIMS):

@@ -1,4 +1,4 @@
-"""Exact Boer reservoir and conversion terms available through stage 3."""
+"""Exact Boer reservoir and conversion diagnostics."""
 
 from .closure import four_box_residual_generation_dissipation, four_box_storage_tendencies
 from .conversions import (

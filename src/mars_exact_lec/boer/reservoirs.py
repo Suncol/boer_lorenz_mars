@@ -1,4 +1,4 @@
-"""Exact Boer reservoirs: kinetic energy plus stage-3 total APE terms."""
+"""Exact Boer reservoirs: kinetic energy and exact APE terms."""
 
 from __future__ import annotations
 

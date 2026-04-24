@@ -87,7 +87,7 @@ def _build_theta_mass_spectrum(theta_3d: np.ndarray, parcel_mass_3d: np.ndarray)
 def _normalize_relative_surface_geopotential(surface_geopotential: np.ndarray) -> np.ndarray:
     phis = np.asarray(surface_geopotential, dtype=float).reshape(-1)
     if not np.all(np.isfinite(phis)):
-        raise ValueError("Surface geopotential must remain finite for the stage-3 reference-state solve.")
+        raise ValueError("Surface geopotential must remain finite for the reference-state solve.")
     return phis - float(np.min(phis))
 
 
@@ -673,7 +673,7 @@ def _solve_time_slice_reference_state(
         pressure_tolerance=pressure_tolerance,
     )
     if not converged:
-        raise ValueError("Stage-3 terrain-dependent reference-state solve failed to converge.")
+        raise ValueError("Terrain-dependent reference-state solve failed to converge.")
 
     pi_s_flat = _surface_pressure_from_solved_profile(profile, phis_rel_flat, constants=constants)
     pi_reference = _reference_curve_from_solved_profile(

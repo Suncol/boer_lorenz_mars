@@ -1,4 +1,4 @@
-"""Coordinate-derivative helpers shared by the stage-3 exact topographic terms."""
+"""Coordinate-derivative helpers for exact topographic diagnostics."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Geopotential helpers for the stage-3 exact topographic terms."""
+"""Geopotential helpers for exact topographic diagnostics."""
 
 from __future__ import annotations
 

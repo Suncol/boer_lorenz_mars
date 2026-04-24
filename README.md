@@ -183,6 +183,25 @@ The `mars_exact_lec` exact/topography-aware branch now distinguishes two differe
 - `TopographyAwareMeasure` provides the shared finite-volume partial-cell measure used by the
   exact branch for rigorous diagnostics over uneven topography.
 
+Symbol quick reference:
+
+| Symbol / API name | Meaning in this branch |
+| --- | --- |
+| `Theta` | Sharp 0/1 above-ground cell-center mask used for representative fields and validity masks. |
+| `theta_mask` | Public API name for above-ground mask or coverage input; this is not physical potential temperature. |
+| `theta` | Physical potential temperature field used by reference-state and thermodynamic calculations. |
+| `theta_levels` | Fixed isentropic coordinate used inside the Koehler (1986) reference-state solver. |
+| `measure` | `TopographyAwareMeasure` finite-volume partial-cell mass/coverage object. |
+| `measure.cell_fraction` | Partial-cell above-ground fraction derived from `ps` and pressure interfaces. |
+| `ps` | Raw surface pressure used to build topographic coverage and effective bottoms. |
+| `p_s_eff` | Effective surface pressure after applying the measure policy, including clipping when requested. |
+| `phis` | Surface geopotential required for topographic reference-state calculations and surface terms. |
+| `geopotential` | Native GCM level-center geopotential. |
+| `interface_geopotential` | Native GCM interface geopotential for the highest-accuracy `C_K2` path. |
+| `pi`, `pi_Z` | Full and representative-zonal reference pressures. |
+| `N`, `N_Z` | Full and representative-zonal exact APE efficiency factors. |
+| `geopotential_mode` | `C_K2` provenance/strictness mode: `strict`, `hydrostatic`, or `fill`. |
+
 Public exact-Boer APIs call the mask argument `theta_mask` to avoid confusing the above-ground
 coverage field with physical potential temperature `theta`. Positional mask arguments remain
 supported, but keyword calls should use `theta_mask=...`; deprecated `theta=...` mask keywords
@@ -194,25 +213,169 @@ partial-cell weights, `p_s_eff`, and measure-aware representative means by defau
 explicit `measure=` argument is still available as an advanced override when you want to reuse
 an already-constructed measure or control `clip/raise` behavior directly.
 
+Recommended exactness ladder:
+
+- **Strict exact Boer/topographic diagnostics**: use `surface_pressure_policy="raise"`,
+  build `TopographyAwareMeasure` from the same raw `ps` used everywhere else, solve
+  `Koehler1986ReferenceState` with explicit `phis`, pass native GCM `geopotential` or
+  `interface_geopotential`, and keep `geopotential_mode="strict"`.
+- **Truncated-domain exact diagnostics**: use `surface_pressure_policy="clip"` only when
+  you intentionally want diagnostics on the model-resolved pressure domain. Actual clipping
+  emits a `UserWarning` and marks outputs with `not_exact_full_atmosphere=True`.
+- **Approximate `C_K2` diagnostics**: use `geopotential_mode="hydrostatic"` only when you
+  accept hydrostatic reconstruction from `temperature`, `pressure`, `ps`, and `phis`; use
+  `geopotential_mode="fill"` only when you accept log-pressure filling of gaps in an explicit
+  level-center `geopotential` field.
+- **Intentional flat-surface reference state**: omit `phis` only for a deliberate flat-surface
+  reference solve, and spell that intent with `assume_flat_surface=True`. Do not use this for
+  topographic exact Mars diagnostics.
+
+Recommended strict calling template:
+
+This assumes the caller already has pressure-level fields (`u`, `v`, `omega`,
+`temperature`, `pressure`), surface fields (`ps`, `phis`, and either
+`surface_theta` or `surface_temperature`), and native GCM `geopotential` or
+`interface_geopotential`.
+
 ```python
-from mars_exact_lec.boer.reservoirs import kinetic_energy_zonal
-from mars_exact_lec.common import build_mass_integrator
+from mars_exact_lec.boer.conversions import (
+    conversion_eddy_ape_to_ke,
+    conversion_zonal_ape_to_eddy_ape,
+    conversion_zonal_ape_to_ke,
+    conversion_zonal_ke_to_eddy_ke,
+)
+from mars_exact_lec.boer.reservoirs import (
+    available_potential_energy_eddy,
+    available_potential_energy_zonal,
+    kinetic_energy_eddy,
+    kinetic_energy_zonal,
+)
+from mars_exact_lec.common import (
+    TopographyAwareMeasure,
+    build_mass_integrator,
+    weighted_representative_zonal_mean,
+)
+from mars_exact_lec.io.mask_below_ground import make_theta
+from mars_exact_lec.reference_state import (
+    Koehler1986ReferenceState,
+    potential_temperature,
+)
 
 integrator = build_mass_integrator(level, latitude, longitude)
-result = kinetic_energy_zonal(u, v, theta_mask, integrator, ps=ps)
-```
-
-If you prefer to build the measure yourself, the exact branch still supports that path:
-
-```python
-from mars_exact_lec.common import TopographyAwareMeasure, build_mass_integrator
-
-integrator = build_mass_integrator(level, latitude, longitude)
+theta_mask = make_theta(pressure, ps)
 measure = TopographyAwareMeasure.from_surface_pressure(
     level,
     ps,
     integrator,
     surface_pressure_policy="raise",
+)
+
+potential_temperature_field = potential_temperature(
+    temperature,
+    pressure,
+    constants=integrator.constants,
+)
+
+reference_state = Koehler1986ReferenceState(
+    surface_pressure_policy="raise",
+).solve(
+    potential_temperature_field,
+    pressure,
+    ps,
+    phis=phis,
+    # Or pass surface_temperature=ts if surface potential temperature is not precomputed.
+    surface_potential_temperature=surface_theta,
+)
+
+representative_theta = weighted_representative_zonal_mean(
+    potential_temperature_field,
+    measure.cell_fraction,
+)
+representative_pressure = weighted_representative_zonal_mean(
+    pressure,
+    measure.cell_fraction,
+)
+n_z = reference_state.zonal_efficiency(representative_theta, representative_pressure)
+
+K_Z = kinetic_energy_zonal(
+    u,
+    v,
+    theta_mask=theta_mask,
+    integrator=integrator,
+    measure=measure,
+    ps=ps,
+)
+K_E = kinetic_energy_eddy(
+    u,
+    v,
+    theta_mask=theta_mask,
+    integrator=integrator,
+    measure=measure,
+    ps=ps,
+)
+A_Z = available_potential_energy_zonal(
+    temperature,
+    pressure,
+    theta_mask=theta_mask,
+    integrator=integrator,
+    reference_state=reference_state,
+    measure=measure,
+    ps=ps,
+    phis=phis,
+    potential_temperature_field=potential_temperature_field,
+)
+A_E = available_potential_energy_eddy(
+    temperature,
+    pressure,
+    theta_mask=theta_mask,
+    integrator=integrator,
+    reference_state=reference_state,
+    measure=measure,
+    ps=ps,
+    phis=phis,
+    potential_temperature_field=potential_temperature_field,
+)
+
+C_Z = conversion_zonal_ape_to_ke(
+    omega,
+    alpha,
+    theta_mask=theta_mask,
+    integrator=integrator,
+    measure=measure,
+    ps=ps,
+    phis=phis,
+)
+C_A = conversion_zonal_ape_to_eddy_ape(
+    temperature,
+    u,
+    v,
+    omega,
+    n_z,
+    theta_mask=theta_mask,
+    integrator=integrator,
+    measure=measure,
+    ps=ps,
+)
+C_E = conversion_eddy_ape_to_ke(
+    omega,
+    alpha,
+    theta_mask=theta_mask,
+    integrator=integrator,
+    measure=measure,
+    ps=ps,
+)
+C_K = conversion_zonal_ke_to_eddy_ke(
+    u,
+    v,
+    omega,
+    theta_mask=theta_mask,
+    integrator=integrator,
+    measure=measure,
+    geopotential=geopotential,
+    interface_geopotential=interface_geopotential,
+    ps=ps,
+    phis=phis,
+    geopotential_mode="strict",
 )
 ```
 

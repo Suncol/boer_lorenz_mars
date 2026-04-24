@@ -1,4 +1,4 @@
-"""Mass integrals for phase-1 Mars exact diagnostics."""
+"""Mass integrals for Mars exact diagnostics."""
 
 from __future__ import annotations
 
@@ -233,7 +233,7 @@ def build_mass_integrator(
     latitude_cell_bounds: xr.DataArray | None = None,
     longitude_cell_bounds: xr.DataArray | None = None,
 ) -> MassIntegrator:
-    """Build a phase-1 Mars mass integrator from 1D coordinates."""
+    """Build a Mars exact mass integrator from 1D coordinates."""
 
     level = normalize_coordinate(level, "level")
     latitude = normalize_coordinate(latitude, "latitude")
