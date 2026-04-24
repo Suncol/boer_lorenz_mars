@@ -83,6 +83,22 @@ def test_four_box_residual_generation_and_dissipation_follow_budget_identities()
     assert diagnostics.attrs["surface_pressure_policy"] == "raise"
 
 
+def test_four_box_residuals_zero_for_closed_synthetic_budget():
+    A_Z = _series("A_Z", [28800.0, 14400.0, 0.0], "J")
+    A_E = _series("A_E", [14400.0, 7200.0, 0.0], "J")
+    K_Z = _series("K_Z", [7200.0, 3600.0, 0.0], "J")
+    K_E = _series("K_E", [0.0, 25200.0, 50400.0], "J")
+    C_Z = _series("C_Z", [1.0, 1.0, 1.0], "W")
+    C_A = _series("C_A", [3.0, 3.0, 3.0], "W")
+    C_E = _series("C_E", [5.0, 5.0, 5.0], "W")
+    C_K = _series("C_K", [2.0, 2.0, 2.0], "W")
+
+    diagnostics = four_box_residual_generation_dissipation(A_Z, A_E, K_Z, K_E, C_Z, C_A, C_E, C_K)
+
+    for name in ("G_Z", "G_E", "F_Z", "F_E"):
+        np.testing.assert_allclose(diagnostics[name].values, 0.0, rtol=0.0, atol=1.0e-12)
+
+
 def test_four_box_storage_tendencies_reject_time_coordinate_mismatch():
     a_z = _series("A_Z", [0.0, 3600.0, 7200.0], "J")
     a_e = _series("A_E", [0.0, 7200.0, 14400.0], "J")

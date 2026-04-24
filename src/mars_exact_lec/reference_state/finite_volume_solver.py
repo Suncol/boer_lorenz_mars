@@ -819,9 +819,18 @@ class FiniteVolumeReferenceState:
         ps: xr.DataArray,
         phis: xr.DataArray | None = None,
         *,
+        assume_flat_surface: bool = False,
         level_bounds: xr.DataArray | None = None,
     ) -> ReferenceStateSolution:
         """Return the legacy finite-volume terrain-dependent reference-state solution."""
+
+        if phis is None and not assume_flat_surface:
+            raise ValueError(
+                "FiniteVolumeReferenceState.solve requires 'phis'; pass "
+                "assume_flat_surface=True to use zero flat-surface geopotential explicitly."
+            )
+        if phis is not None and assume_flat_surface:
+            raise ValueError("Pass either 'phis' or assume_flat_surface=True, not both.")
 
         potential_temperature = normalize_field(
             potential_temperature,
@@ -851,6 +860,7 @@ class FiniteVolumeReferenceState:
         if phis is None:
             surface_geopotential = xr.zeros_like(potential_temperature.isel(level=0, drop=True), dtype=float)
             surface_geopotential.name = "phis"
+            surface_geopotential.attrs["units"] = "m2 s-2"
         else:
             surface_geopotential = broadcast_surface_field(phis, potential_temperature, "phis")
 

@@ -23,8 +23,10 @@ from .koehler1986_geometry import (
     _reference_mass_from_profile_numpy,
 )
 from .koehler1986_preprocessing import (
+    DEFAULT_MONOTONIC_POLICY,
     _KoehlerObservedStateContext,
     _prepare_koehler1986_observed_context,
+    _validate_monotonic_policy,
 )
 from .solution import REFERENCE_INTERFACE_DIM, REFERENCE_SAMPLE_DIM, ReferenceStateSolution
 
@@ -78,7 +80,7 @@ class Koehler1986ReferenceState:
         theta_increment: float | None = None,
         surface_pressure_policy: str = "raise",
         interpolation_space: str = "exner",
-        monotonic_policy: str = "repair",
+        monotonic_policy: str = DEFAULT_MONOTONIC_POLICY,
         max_iterations: int = 50,
         pressure_tolerance: float = 1.0e-3,
         iteration_tolerance: float = 1.0e-3,
@@ -89,7 +91,7 @@ class Koehler1986ReferenceState:
         self.theta_increment = theta_increment
         self.surface_pressure_policy = surface_pressure_policy
         self.interpolation_space = interpolation_space
-        self.monotonic_policy = monotonic_policy
+        self.monotonic_policy = _validate_monotonic_policy(monotonic_policy)
         self.max_iterations = max_iterations
         self.pressure_tolerance = pressure_tolerance
         self.iteration_tolerance = iteration_tolerance
@@ -106,12 +108,20 @@ class Koehler1986ReferenceState:
         *,
         surface_potential_temperature: xr.DataArray | None = None,
         surface_temperature: xr.DataArray | None = None,
+        assume_flat_surface: bool = False,
         theta_levels: xr.DataArray | Sequence[float] | None = None,
         theta_increment: float | None = None,
         level_bounds: xr.DataArray | None = None,
     ) -> ReferenceStateSolution:
         self._last_observed_state = None
         self._last_geometry_state = None
+        if phis is None and not assume_flat_surface:
+            raise ValueError(
+                "Koehler1986ReferenceState.solve requires 'phis'; pass "
+                "assume_flat_surface=True to use zero flat-surface geopotential explicitly."
+            )
+        if phis is not None and assume_flat_surface:
+            raise ValueError("Pass either 'phis' or assume_flat_surface=True, not both.")
 
         full_context = _prepare_koehler1986_observed_context(
             potential_temperature,
@@ -129,6 +139,7 @@ class Koehler1986ReferenceState:
             monotonic_policy=self.monotonic_policy,
         )
         self._last_observed_state = full_context.observed_state
+        _raise_for_rejected_monotonic_columns(full_context, family_name="full")
 
         if phis is None:
             phis_surface = xr.zeros_like(full_context.surface_pressure, dtype=float)
@@ -175,6 +186,7 @@ class Koehler1986ReferenceState:
             interpolation_space=self.interpolation_space,
             monotonic_policy=self.monotonic_policy,
         )
+        _raise_for_rejected_monotonic_columns(zonal_context, family_name="zonal")
         zonal_family = _solve_reference_family_koehler1986(
             "zonal",
             zonal_context,
@@ -206,6 +218,30 @@ def _validate_solver_strategy(solver_strategy: str) -> str:
     if normalized not in {"koehler_iteration", "root"}:
         raise ValueError("'solver_strategy' must be either 'koehler_iteration' or 'root'.")
     return normalized
+
+
+def _raise_for_rejected_monotonic_columns(
+    context: _KoehlerObservedStateContext,
+    *,
+    family_name: str,
+) -> None:
+    if context.observed_state.attrs.get("monotonic_policy") != "reject":
+        return
+
+    violations = context.observed_state["monotonic_violations"]
+    violating_columns = violations > 0
+    count = int(violating_columns.sum())
+    if count == 0:
+        return
+
+    max_violations = int(violations.max())
+    raise ValueError(
+        "Koehler1986 reference-state preprocessing found "
+        f"{count} {family_name} column(s) with non-monotonic potential-temperature profiles "
+        f"(max negative steps per column: {max_violations}) under monotonic_policy='reject'. "
+        "Pass monotonic_policy='repair' to opt in to the monotonic-envelope repair; "
+        "the resulting ReferenceStateSolution records monotonic_violations and monotonic_repairs."
+    )
 
 
 def _surface_zonal_mean_geometric(field: xr.DataArray) -> xr.DataArray:
@@ -755,6 +791,22 @@ def _build_reference_state_solution(
         converged=full_family.converged.rename("reference_state_converged"),
         iterations_zonal=zonal_family.iterations.rename("reference_state_iterations_zonal"),
         converged_zonal=zonal_family.converged.rename("reference_state_converged_zonal"),
+        monotonic_violations=_annotate_domain(
+            context.observed_state["monotonic_violations"].rename("reference_state_monotonic_violations")
+        ),
+        monotonic_repairs=_annotate_domain(
+            context.observed_state["monotonic_repairs"].rename("reference_state_monotonic_repairs")
+        ),
+        monotonic_violations_zonal=_annotate_domain(
+            zonal_family.context.observed_state["monotonic_violations"].rename(
+                "reference_state_monotonic_violations_zonal"
+            )
+        ),
+        monotonic_repairs_zonal=_annotate_domain(
+            zonal_family.context.observed_state["monotonic_repairs"].rename(
+                "reference_state_monotonic_repairs_zonal"
+            )
+        ),
         method=method,
         constants=constants,
         _theta_reference_zonal=theta_reference_zonal,

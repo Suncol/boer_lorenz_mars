@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 np = pytest.importorskip("numpy")
 xr = pytest.importorskip("xarray")
 
+import mars_exact_lec.reference_state as reference_state_module
+import mars_exact_lec.reference_state.koehler_solver as koehler_solver_module
 from mars_exact_lec.reference_state import (
     FiniteVolumeReferenceState,
     Koehler1986ReferenceState,
-    KoehlerReferenceState,
     ReferenceStateSolution,
     potential_temperature,
 )
@@ -33,11 +36,43 @@ def _build_reference_inputs():
     return pt, pressure, ps, phis
 
 
+def _build_nonmonotonic_reference_inputs():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[900.0, 700.0, 500.0])
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 950.0)
+    phis = surface_geopotential(time, latitude, longitude, 0.0)
+    temperature = temperature_from_theta_values(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.asarray([190.0, 185.0, 230.0])[None, :, None, None],
+    )
+    pt = potential_temperature(temperature, pressure)
+    surface_theta = xr.full_like(ps, 170.0, dtype=float)
+    surface_theta.name = "surface_potential_temperature"
+    surface_theta.attrs["units"] = "K"
+    return pt, pressure, ps, phis, surface_theta
+
+
 def test_reference_state_public_exports_include_phase01_classes():
-    assert KoehlerReferenceState is FiniteVolumeReferenceState
-    assert FiniteVolumeReferenceState is not None
-    assert Koehler1986ReferenceState is not None
+    assert reference_state_module.FiniteVolumeReferenceState is FiniteVolumeReferenceState
+    assert reference_state_module.Koehler1986ReferenceState is Koehler1986ReferenceState
+    assert "FiniteVolumeReferenceState" in reference_state_module.__all__
+    assert "Koehler1986ReferenceState" in reference_state_module.__all__
+    assert "KoehlerReferenceState" not in reference_state_module.__all__
     assert ReferenceStateSolution is not None
+
+
+def test_reference_state_legacy_alias_access_warns_from_package_and_shim():
+    with pytest.warns(DeprecationWarning, match="deprecated legacy alias"):
+        package_alias = reference_state_module.KoehlerReferenceState
+    with pytest.warns(DeprecationWarning, match="deprecated legacy alias"):
+        shim_alias = koehler_solver_module.KoehlerReferenceState
+
+    assert package_alias is FiniteVolumeReferenceState
+    assert shim_alias is FiniteVolumeReferenceState
+    assert "KoehlerReferenceState" not in koehler_solver_module.__all__
 
 
 def test_reference_state_koehler_solver_shim_reexports_legacy_private_helper():
@@ -47,7 +82,9 @@ def test_reference_state_koehler_solver_shim_reexports_legacy_private_helper():
 def test_finite_volume_reference_state_matches_legacy_alias_and_sets_metadata():
     pt, pressure, ps, phis = _build_reference_inputs()
 
-    legacy_solution = KoehlerReferenceState().solve(pt, pressure, ps, phis=phis)
+    with pytest.warns(DeprecationWarning, match="deprecated legacy alias"):
+        legacy_cls = reference_state_module.KoehlerReferenceState
+    legacy_solution = legacy_cls().solve(pt, pressure, ps, phis=phis)
     fv_solution = FiniteVolumeReferenceState().solve(pt, pressure, ps, phis=phis)
 
     assert isinstance(legacy_solution, ReferenceStateSolution)
@@ -88,6 +125,7 @@ def test_koehler1986_reference_state_minimal_smoke_solve():
     surface_theta = xr.full_like(ps, 170.0, dtype=float)
 
     solver = Koehler1986ReferenceState()
+    assert solver.monotonic_policy == "reject"
     solution = solver.solve(
         pt,
         pressure,
@@ -107,3 +145,86 @@ def test_koehler1986_reference_state_minimal_smoke_solve():
     assert np.isfinite(solution.pi_sZ.values).all()
     assert bool(solution.converged.values.all())
     assert bool(solution.converged_zonal.values.all())
+    assert solver._last_observed_state.attrs["monotonic_policy"] == "reject"
+    assert solution.monotonic_violations is not None
+    assert solution.monotonic_repairs is not None
+    assert int(solution.monotonic_violations.max()) == 0
+    assert int(solution.monotonic_repairs.max()) == 0
+
+
+def test_reference_state_solution_rejects_nonconverged_full_curve_evaluation():
+    pt, pressure, ps, phis = _build_reference_inputs()
+    solution = FiniteVolumeReferenceState().solve(pt, pressure, ps, phis=phis)
+    bad_status = xr.DataArray(
+        np.asarray([False], dtype=bool),
+        dims=("time",),
+        coords={"time": solution.converged.coords["time"].values},
+        name="reference_state_converged",
+    )
+    nonconverged = replace(solution, converged=bad_status)
+
+    with pytest.raises(ValueError, match="non-converged reference state"):
+        nonconverged.reference_pressure(pt)
+    with pytest.raises(ValueError, match="non-converged reference state"):
+        nonconverged.efficiency(pt, pressure)
+
+
+def test_reference_state_solution_rejects_missing_zonal_convergence():
+    pt, pressure, ps, phis = _build_reference_inputs()
+    solution = FiniteVolumeReferenceState().solve(pt, pressure, ps, phis=phis)
+    missing_status = xr.DataArray(
+        np.asarray([np.nan], dtype=float),
+        dims=("time",),
+        coords={"time": solution.converged_zonal.coords["time"].values},
+        name="reference_state_converged_zonal",
+    )
+    nonconverged = replace(solution, converged_zonal=missing_status)
+    representative_theta = pt.mean(dim="longitude")
+    representative_pressure = pressure.mean(dim="longitude")
+
+    with pytest.raises(ValueError, match="non-converged reference state"):
+        nonconverged.zonal_reference_pressure(representative_theta)
+    with pytest.raises(ValueError, match="non-converged reference state"):
+        nonconverged.zonal_efficiency(representative_theta, representative_pressure)
+
+
+def test_koehler1986_reference_state_defaults_to_reject_nonmonotonic_profiles():
+    pt, pressure, ps, phis, surface_theta = _build_nonmonotonic_reference_inputs()
+    solver = Koehler1986ReferenceState(theta_levels=[170.0, 190.0, 210.0, 230.0, 250.0])
+
+    with pytest.raises(ValueError, match="monotonic_policy='reject'"):
+        solver.solve(
+            pt,
+            pressure,
+            ps,
+            phis=phis,
+            surface_potential_temperature=surface_theta,
+        )
+
+
+def test_koehler1986_reference_state_repair_is_explicit_and_recorded():
+    pt, pressure, ps, phis, surface_theta = _build_nonmonotonic_reference_inputs()
+    solver = Koehler1986ReferenceState(
+        theta_levels=[170.0, 190.0, 210.0, 230.0, 250.0],
+        monotonic_policy="repair",
+        pressure_tolerance=1.0e-6,
+        max_iterations=64,
+    )
+
+    solution = solver.solve(
+        pt,
+        pressure,
+        ps,
+        phis=phis,
+        surface_potential_temperature=surface_theta,
+    )
+
+    assert solver._last_observed_state.attrs["monotonic_policy"] == "repair"
+    assert solution.monotonic_violations is not None
+    assert solution.monotonic_repairs is not None
+    assert solution.monotonic_violations_zonal is not None
+    assert solution.monotonic_repairs_zonal is not None
+    assert int(solution.monotonic_violations.max()) == 1
+    assert int(solution.monotonic_repairs.max()) == 1
+    assert int(solution.monotonic_violations_zonal.max()) == 1
+    assert int(solution.monotonic_repairs_zonal.max()) == 1

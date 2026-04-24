@@ -33,6 +33,8 @@ from .interpolate_isentropes import (
     pressure_level_edges,
 )
 
+DEFAULT_MONOTONIC_POLICY = "reject"
+
 
 @dataclass(frozen=True)
 class _KoehlerObservedStateContext:
@@ -198,8 +200,9 @@ def interpolate_pressure_to_koehler_isentropes(
     theta_levels: xr.DataArray | Sequence[float],
     *,
     theta_mask: xr.DataArray | None = None,
+    level_bounds: xr.DataArray | None = None,
     interpolation_space: str = "exner",
-    monotonic_policy: str = "repair",
+    monotonic_policy: str = DEFAULT_MONOTONIC_POLICY,
 ) -> xr.Dataset:
     """Interpolate pressure to fixed Koehler (1986) isentropic surfaces."""
 
@@ -219,7 +222,7 @@ def interpolate_pressure_to_koehler_isentropes(
         "surface_potential_temperature",
     )
     targets = normalize_isentropic_coordinate(theta_levels, name=ISENTROPIC_DIM)
-    level_edges = pressure_level_edges(theta.coords["level"])
+    level_edges = pressure_level_edges(theta.coords["level"], bounds=level_bounds)
 
     interpolation_space = _validate_interpolation_space(interpolation_space)
     monotonic_policy = _validate_monotonic_policy(monotonic_policy)
@@ -344,7 +347,7 @@ def interpolate_pressure_to_koehler_isentropes(
     data["column_top_edge_pressure"].attrs.update({"units": "Pa", "long_name": "upper interface of the top resolved pressure level in the column"})
     data["column_bottom_edge_pressure"].attrs.update({"units": "Pa", "long_name": "lower interface of the bottom resolved pressure level in the column"})
     data["valid_level_count"].attrs["long_name"] = "number of above-ground resolved pressure levels used for interpolation"
-    data["monotonic_violations"].attrs["long_name"] = "count of negative theta steps before monotonic repair"
+    data["monotonic_violations"].attrs["long_name"] = "count of negative theta steps before any monotonic repair"
     data["monotonic_repairs"].attrs["long_name"] = "count of theta values raised by monotonic repair"
     return data
 
@@ -506,7 +509,7 @@ def _prepare_koehler1986_observed_state(
     surface_pressure_policy: str = "raise",
     pressure_tolerance: float = 1.0e-3,
     interpolation_space: str = "exner",
-    monotonic_policy: str = "repair",
+    monotonic_policy: str = DEFAULT_MONOTONIC_POLICY,
 ) -> xr.Dataset:
     """Build the Koehler (1986) observed-state preprocessing dataset."""
 
@@ -541,7 +544,7 @@ def _prepare_koehler1986_observed_context(
     surface_pressure_policy: str = "raise",
     pressure_tolerance: float = 1.0e-3,
     interpolation_space: str = "exner",
-    monotonic_policy: str = "repair",
+    monotonic_policy: str = DEFAULT_MONOTONIC_POLICY,
 ) -> _KoehlerObservedStateContext:
     """Build the private preprocessing context used by later K86 phases."""
 
@@ -590,6 +593,7 @@ def _prepare_koehler1986_observed_context(
         surface_theta,
         resolved_theta_levels,
         theta_mask=theta_mask,
+        level_bounds=level_bounds,
         interpolation_space=interpolation_space,
         monotonic_policy=monotonic_policy,
     )

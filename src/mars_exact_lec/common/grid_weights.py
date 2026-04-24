@@ -6,7 +6,12 @@ import numpy as np
 import xarray as xr
 from numpy.polynomial.legendre import leggauss
 
-from .._validation import normalize_coordinate
+from .._validation import (
+    _require_1d_coord,
+    _validate_longitude,
+    normalize_coordinate,
+    require_dataarray,
+)
 from ..constants_mars import MARS
 
 
@@ -75,6 +80,82 @@ def _get_explicit_bounds(coord: xr.DataArray, bounds: xr.DataArray | None = None
     return None
 
 
+def _normalize_longitude_coordinate(longitude: xr.DataArray) -> xr.DataArray:
+    longitude = require_dataarray(longitude, "longitude")
+    longitude = _require_1d_coord(longitude, "longitude")
+    if longitude.name != "longitude":
+        longitude = longitude.rename("longitude")
+    return longitude
+
+
+def _unwrap_longitude_bound_pair(
+    lower: float,
+    upper: float,
+    center: float,
+) -> tuple[float, float]:
+    while upper <= lower:
+        upper += 360.0
+    while center < lower - _BOUNDS_TOL:
+        lower -= 360.0
+        upper -= 360.0
+    while center > upper + _BOUNDS_TOL:
+        lower += 360.0
+        upper += 360.0
+    return lower, upper
+
+
+def _validate_explicit_longitude_bounds(
+    longitude: xr.DataArray,
+    bounds: xr.DataArray,
+) -> xr.DataArray:
+    values = np.asarray(bounds.values, dtype=float)
+    centers = np.asarray(longitude.values, dtype=float)
+    if values.shape[0] != centers.size:
+        raise ValueError("Explicit longitude bounds must have one row per longitude coordinate.")
+    if not np.all(np.isfinite(values)):
+        raise ValueError("Explicit longitude bounds must contain only finite degree values.")
+
+    unwrapped = np.empty_like(values, dtype=float)
+    for idx, (raw_lower, raw_upper) in enumerate(values):
+        lower, upper = _unwrap_longitude_bound_pair(
+            float(raw_lower),
+            float(raw_upper),
+            float(centers[idx]),
+        )
+        if not (lower - _BOUNDS_TOL <= centers[idx] <= upper + _BOUNDS_TOL):
+            raise ValueError(
+                "Each longitude coordinate must lie inside its corresponding longitude bounds "
+                "modulo 360 degrees."
+            )
+        unwrapped[idx, 0] = lower
+        unwrapped[idx, 1] = upper
+
+    widths = unwrapped[:, 1] - unwrapped[:, 0]
+    if np.any(widths <= _BOUNDS_TOL):
+        raise ValueError("Explicit longitude bounds must define positive-width cells.")
+    if values.shape[0] > 1 and not np.allclose(
+        unwrapped[:-1, 1],
+        unwrapped[1:, 0],
+        atol=_BOUNDS_TOL,
+    ):
+        raise ValueError(
+            "Explicit longitude bounds must be contiguous, non-overlapping positive-width "
+            "cells that tile exactly 360 degrees."
+        )
+    if not np.isclose(unwrapped[-1, 1] - unwrapped[0, 0], 360.0, atol=_BOUNDS_TOL):
+        raise ValueError(
+            "Explicit longitude bounds must be contiguous, non-overlapping positive-width "
+            "cells that tile exactly 360 degrees."
+        )
+
+    return xr.DataArray(
+        unwrapped,
+        dims=("longitude", "bounds"),
+        coords={"longitude": longitude.values, "bounds": [0, 1]},
+        name="longitude_bounds",
+    )
+
+
 def _derive_latitude_bounds(latitude: xr.DataArray) -> xr.DataArray:
     values = np.asarray(latitude.values, dtype=float)
     try:
@@ -128,6 +209,7 @@ def _derive_latitude_bounds(latitude: xr.DataArray) -> xr.DataArray:
 
 
 def _derive_longitude_bounds(longitude: xr.DataArray) -> xr.DataArray:
+    longitude = _validate_longitude(longitude, require_regular_global_ring=True)
     values = np.asarray(longitude.values, dtype=float)
     edges = np.empty(values.size + 1, dtype=float)
     edges[1:-1] = 0.5 * (values[:-1] + values[1:])
@@ -183,21 +265,14 @@ def latitude_bounds(latitude: xr.DataArray, *, bounds: xr.DataArray | None = Non
 def longitude_bounds(longitude: xr.DataArray, *, bounds: xr.DataArray | None = None) -> xr.DataArray:
     """Return longitude bounds, using explicit bounds when available."""
 
-    longitude = normalize_coordinate(longitude, "longitude")
+    longitude = _normalize_longitude_coordinate(longitude)
     resolved_bounds = _get_explicit_bounds(longitude, bounds=bounds)
+    longitude = _validate_longitude(
+        longitude,
+        require_regular_global_ring=resolved_bounds is None,
+    )
     if resolved_bounds is not None:
-        values = np.asarray(resolved_bounds.values, dtype=float)
-        widths = values[:, 1] - values[:, 0]
-        if np.any(widths <= 0.0) or not np.isclose(widths.sum(), 360.0, atol=1e-6):
-            raise ValueError(
-                "Explicit longitude bounds must define a full global ring with positive widths."
-            )
-        return xr.DataArray(
-            values,
-            dims=("longitude", "bounds"),
-            coords={"longitude": longitude.values, "bounds": [0, 1]},
-            name="longitude_bounds",
-        )
+        return _validate_explicit_longitude_bounds(longitude, resolved_bounds)
     return _derive_longitude_bounds(longitude)
 
 
@@ -266,12 +341,12 @@ def longitude_weights(
 ) -> xr.DataArray:
     """Return longitude weights from cyclic cell widths."""
 
-    longitude = normalize_coordinate(longitude, "longitude")
     resolved_bounds = longitude_bounds(longitude, bounds=bounds)
+    longitude_values = resolved_bounds.coords["longitude"].values
     widths = xr.DataArray(
         np.deg2rad(resolved_bounds.isel(bounds=1).values - resolved_bounds.isel(bounds=0).values),
         dims=("longitude",),
-        coords={"longitude": longitude.values},
+        coords={"longitude": longitude_values},
         name="longitude_widths",
     )
     if normalize:
@@ -312,7 +387,6 @@ def cell_area(
     """Return the area of each latitude-longitude grid cell."""
 
     latitude = normalize_coordinate(latitude, "latitude")
-    longitude = normalize_coordinate(longitude, "longitude")
     band_area = zonal_band_area(latitude, radius=radius, latitude_cell_bounds=latitude_cell_bounds)
     lon_widths = longitude_weights(longitude, normalize=True, bounds=longitude_cell_bounds)
     area = band_area * lon_widths

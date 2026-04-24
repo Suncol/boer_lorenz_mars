@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 np = pytest.importorskip("numpy")
@@ -43,6 +45,13 @@ def test_topography_measure_above_ground_dp_cell_fraction_and_parcel_mass_match_
     expected_fraction = expected_dp / np.asarray([[[[400.0]], [[400.0]]]])
 
     np.testing.assert_allclose(measure.above_ground_dp.values, expected_dp)
+    np.testing.assert_allclose(
+        measure.effective_bottom_pressure.values,
+        measure.upper_edge.broadcast_like(measure.above_ground_dp).values + expected_dp,
+    )
+    assert measure.effective_bottom_pressure.dims == ("time", "level", "latitude", "longitude")
+    assert measure.effective_bottom_pressure.attrs["units"] == "Pa"
+    assert measure.effective_bottom_pressure.attrs["domain"] == "full_model_pressure_domain"
     np.testing.assert_allclose(measure.cell_fraction.values, expected_fraction)
     np.testing.assert_allclose(
         measure.parcel_mass.values,
@@ -84,18 +93,20 @@ def test_topography_measure_surface_pressure_policy_raise_and_clip():
     with pytest.raises(ValueError, match="Surface pressure extends below the deepest model pressure interface"):
         TopographyAwareMeasure.from_surface_pressure(level, ps, integrator)
 
-    clipped = TopographyAwareMeasure.from_surface_pressure(
-        level,
-        ps,
-        integrator,
-        surface_pressure_policy="clip",
-    )
+    with pytest.warns(UserWarning, match="truncated pressure domain"):
+        clipped = TopographyAwareMeasure.from_surface_pressure(
+            level,
+            ps,
+            integrator,
+            surface_pressure_policy="clip",
+        )
 
     np.testing.assert_allclose(clipped.effective_surface_pressure.values, 1000.0)
     assert clipped.surface_pressure_policy == "clip"
     assert clipped.surface_pressure.attrs["domain"] == "truncated_to_model_pressure_domain"
     assert clipped.effective_surface_pressure.attrs["not_exact_full_atmosphere"] is True
     assert clipped.above_ground_dp.attrs["surface_pressure_policy"] == "clip"
+    assert clipped.effective_bottom_pressure.attrs["domain"] == "truncated_to_model_pressure_domain"
     assert clipped.cell_fraction.attrs["domain"] == "truncated_to_model_pressure_domain"
     assert clipped.parcel_mass.attrs["not_exact_full_atmosphere"] is True
     assert clipped.zonal_mass.attrs["surface_pressure_policy"] == "clip"
@@ -108,6 +119,25 @@ def test_topography_measure_surface_pressure_policy_raise_and_clip():
     )
     assert raised.effective_surface_pressure.attrs["domain"] == "full_model_pressure_domain"
     assert raised.effective_surface_pressure.attrs["not_exact_full_atmosphere"] is False
+
+
+def test_clip_policy_does_not_warn_when_surface_pressure_is_inside_model_domain():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[800.0, 400.0], nlat=2, nlon=4)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 900.0)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        measure = TopographyAwareMeasure.from_surface_pressure(
+            level,
+            ps,
+            integrator,
+            surface_pressure_policy="clip",
+        )
+
+    assert not [warning for warning in caught if warning.category is UserWarning]
+    assert measure.effective_surface_pressure.attrs["domain"] == "truncated_to_model_pressure_domain"
+    assert measure.effective_surface_pressure.attrs["not_exact_full_atmosphere"] is True
 
 
 def test_topography_measure_rejects_effective_surface_pressure_inconsistent_with_policy():

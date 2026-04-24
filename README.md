@@ -168,6 +168,12 @@ source .venv/bin/activate
 python -m pytest -m live_seba -rs tests/test_seba_validation.py
 ```
 
+The validation helper `seba_energy_components_per_level()` exposes SEBA spectral
+`rke`, `dke`, `hke`, `vke`, and `ape` components after summing over horizontal
+wavenumber. These are cross-check fields from the SEBA branch; they are not Boer
+exact four-reservoir diagnostics and should not be interpreted as equivalent to
+the Mars exact LEC APE/KE reservoirs.
+
 ## Mars exact LEC notes
 
 The `mars_exact_lec` exact/topography-aware branch now distinguishes two different objects:
@@ -176,6 +182,11 @@ The `mars_exact_lec` exact/topography-aware branch now distinguishes two differe
   validity masks, and derivative-domain masking.
 - `TopographyAwareMeasure` provides the shared finite-volume partial-cell measure used by the
   exact branch for rigorous diagnostics over uneven topography.
+
+Public exact-Boer APIs call the mask argument `theta_mask` to avoid confusing the above-ground
+coverage field with physical potential temperature `theta`. Positional mask arguments remain
+supported, but keyword calls should use `theta_mask=...`; deprecated `theta=...` mask keywords
+are accepted only through a warning-backed compatibility path.
 
 Exact Boer diagnostics now default to the measure-aware finite-volume path. If you pass `ps`,
 the public API auto-constructs a consistent `TopographyAwareMeasure` and uses shared
@@ -188,7 +199,7 @@ from mars_exact_lec.boer.reservoirs import kinetic_energy_zonal
 from mars_exact_lec.common import build_mass_integrator
 
 integrator = build_mass_integrator(level, latitude, longitude)
-result = kinetic_energy_zonal(u, v, theta, integrator, ps=ps)
+result = kinetic_energy_zonal(u, v, theta_mask, integrator, ps=ps)
 ```
 
 If you prefer to build the measure yourself, the exact branch still supports that path:
@@ -218,6 +229,13 @@ If you want a different `surface_pressure_policy`, rebuild the `measure`; passin
 `surface_pressure_policy=` alongside an explicit `measure` does not override the policy stored
 inside that measure.
 
+Reference-state solvers require explicit `phis` for topographic exact calculations. Omit it
+only when intentionally solving a flat-surface problem, and spell that intent with
+`assume_flat_surface=True`. Use the explicit solver names `Koehler1986ReferenceState` for the
+fixed-isentrope Koehler (1986) path and `FiniteVolumeReferenceState` for the legacy finite-volume
+path. `KoehlerReferenceState` is retained only as a deprecated, warning-backed compatibility
+alias to `FiniteVolumeReferenceState`.
+
 When `surface_pressure_policy="clip"`, the exact branch computes diagnostics on the truncated
 model pressure domain rather than the full atmospheric column implied by the raw `ps`. This is
 surfaced explicitly in attrs on measure-aware exact outputs:
@@ -239,17 +257,48 @@ per-area normalization helpers.
 Among the exact conversion terms, `C_K2` is the most sensitive to topography-boundary
 discretization. Its public outputs now carry additional machine-readable provenance attrs:
 
-- `ck2_horizontal_gradient_scheme`
-- `ck2_meridional_gradient_scheme`
-- `ck2_boundary_treatment`
-- `ck2_singleton_segment_policy`
+- `ck2_discretization`
+- `ck2_geopotential_source`
+- `ck2_geopotential_mode`
+- `ck2_geopotential_reconstruction_allowed`
+- `ck2_geopotential_reconstruction_approximate`
+- `ck2_vertical_integral`
+- `ck2_reconstruction`
+- `ck2_bottom_pressure`
+- `ck2_horizontal_boundary_correction`
+- `ck2_pressure_term`
+- `ck2_zonal_mean`
 - `ck2_derivative_mask`
 
-These attrs document that `C_K2` is evaluated on the sharp above-ground `Theta` mask with
-segmented finite differences rather than a fully conservative finite-volume face operator.
-This is an intentional approximation contract. A single `C_K2` value should not be
-interpreted as analytically exact at complex topographic boundaries without complementary
-resolution or topography-smoothing sensitivity checks.
+These attrs document that `C_K2` is evaluated with a cut-cell finite-volume discretization.
+The implementation reconstructs `Phi*` to the layer top and effective bottom pressure,
+forms a trapezoidal pressure-layer integral, applies the Leibniz lower-boundary correction
+for moving or sloping cut cells, and zonally averages the resulting full-layer-normalized
+terms with cell-area weights. By default, the reconstruction uses pressure-linear interpolation
+from an explicit level-center `Phi*` field. If your GCM provides interface geopotential, pass
+`interface_geopotential=` with dims `(time, level_edge, latitude, longitude)`; `C_K2` will
+compute `Phi*` directly on the raw interface faces and use `phis` for partial-cell surface
+bottoms when available. Without `phis`, partial bottoms are reconstructed pressure-linearly
+from interface faces, or from interface plus center geopotential when both
+`interface_geopotential` and `geopotential` are supplied.
+
+High-accuracy `C_K2` should use native GCM `interface_geopotential` or `geopotential`.
+Hydrostatic reconstruction from `temperature`, `pressure`, `ps`, and `phis` is an
+approximate fallback and is disabled by default. Use `geopotential_mode="strict"` for
+the default no-reconstruction path, `geopotential_mode="hydrostatic"` when you explicitly
+accept hydrostatic reconstruction/filling, or `geopotential_mode="fill"` when you only
+want log-pressure filling of gaps in an explicit level-center `geopotential` field.
+The legacy `allow_geopotential_reconstruction=True` spelling is accepted only through a
+warning-backed compatibility path. Approximate outputs mark their provenance with
+`ck2_geopotential_source`, `ck2_geopotential_mode`, and
+`ck2_geopotential_reconstruction_approximate=True`.
+
+Koehler (1986) reference-state preprocessing defaults to
+`monotonic_policy="reject"`. Non-monotonic potential-temperature columns are
+not silently repaired by the public solver; pass `monotonic_policy="repair"`
+only when you explicitly accept the monotonic-envelope modification. Repair
+diagnostics are exposed as `monotonic_violations` and `monotonic_repairs` on
+the returned `ReferenceStateSolution`.
 
 Low-level Boer diagnostics continue to return global integrals in `J` and `W`. To compare against
 paper figures reported in `J m-2` or `W m-2`, normalize them explicitly with

@@ -102,6 +102,9 @@ def _segmented_first_derivative_1d(
         segment_coordinate = coordinate[segment]
         if segment_values.size == 1:
             continue
+        if np.all(segment_values == segment_values[0]):
+            result[segment] = 0.0
+            continue
         edge_order = 2 if segment_values.size > 2 else 1
         result[segment] = np.gradient(segment_values, segment_coordinate, edge_order=edge_order)
     return result

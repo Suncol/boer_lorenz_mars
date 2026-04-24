@@ -1,6 +1,12 @@
 """Common geometric and integral tools for Mars exact diagnostics."""
 
-from .geopotential import broadcast_surface_field, reconstruct_hydrostatic_geopotential, resolve_geopotential
+from .geopotential import (
+    GEOPOTENTIAL_MODES,
+    broadcast_surface_field,
+    normalize_geopotential_mode,
+    reconstruct_hydrostatic_geopotential,
+    resolve_geopotential,
+)
 from .grid_weights import cell_area, infer_grid, latitude_weights, zonal_band_area
 from .integrals import (
     MassIntegrator,
@@ -28,7 +34,9 @@ __all__ = [
     "latitude_weights",
     "cell_area",
     "zonal_band_area",
+    "GEOPOTENTIAL_MODES",
     "broadcast_surface_field",
+    "normalize_geopotential_mode",
     "reconstruct_hydrostatic_geopotential",
     "resolve_geopotential",
     "delta_p",

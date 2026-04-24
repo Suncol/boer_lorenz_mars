@@ -17,10 +17,14 @@ ISENTROPIC_DIM = "isentropic_level"
 ISENTROPIC_LAYER_DIM = "isentropic_layer"
 
 
-def pressure_level_edges(level: xr.DataArray) -> xr.DataArray:
+def pressure_level_edges(
+    level: xr.DataArray,
+    *,
+    bounds: xr.DataArray | None = None,
+) -> xr.DataArray:
     """Return pressure interfaces using the shared mass-integrator convention."""
 
-    return _pressure_level_edges(level)
+    return _pressure_level_edges(level, bounds=bounds)
 
 
 def normalize_isentropic_coordinate(

@@ -9,7 +9,11 @@ from mars_exact_lec.boer.reservoirs import total_horizontal_ke
 from mars_exact_lec.common.integrals import build_mass_integrator, delta_p
 from mars_exact_lec.constants_mars import MARS
 from mars_exact_lec.io.mask_below_ground import make_theta
-from mars_exact_lec.validation import _resolve_live_seba_energy_budget, seba_total_hke_per_level
+from mars_exact_lec.validation import (
+    _resolve_live_seba_energy_budget,
+    seba_energy_components_per_level,
+    seba_total_hke_per_level,
+)
 
 from .helpers import full_field, make_coords, pressure_field, seba_dataset, surface_pressure, surface_pressure_policy_for_case
 
@@ -96,7 +100,30 @@ def test_seba_hke_matches_direct_grid_hke_and_column_integral(live_seba_runtime)
     dataset = seba_dataset(time, level, latitude, longitude, u, v, omega, temperature)
     dataset["geopotential"] = geopotential
     dataset["ts"] = surface_temperature
+    components = seba_energy_components_per_level(dataset, p_levels=level.values, ps=ps, rsphere=MARS.a)
     hke_level = seba_total_hke_per_level(dataset, p_levels=level.values, ps=ps, rsphere=MARS.a)
+
+    assert set(components.data_vars) == {
+        "seba_rke_per_level",
+        "seba_dke_per_level",
+        "seba_hke_per_level",
+        "seba_vke_per_level",
+        "seba_ape_per_level",
+    }
+    assert components.attrs["boer_exact_equivalence"] == "none"
+    for component in components.data_vars.values():
+        assert component.attrs["validation_role"] == "live_seba_spectral_component"
+        assert component.dims == ("time", "level")
+
+    np.testing.assert_allclose(hke_level.values, components["seba_hke_per_level"].values)
+    np.testing.assert_allclose(
+        components["seba_hke_per_level"].values,
+        (components["seba_rke_per_level"] + components["seba_dke_per_level"]).values,
+        rtol=5e-4,
+        atol=1e-8,
+    )
+    np.testing.assert_allclose(components["seba_vke_per_level"].values, 0.0, rtol=0.0, atol=1e-10)
+    np.testing.assert_allclose(components["seba_ape_per_level"].values, 0.0, rtol=0.0, atol=1e-10)
 
     areas = 4.0 * np.pi * MARS.a**2
     direct_hke_level = 0.5 * (u**2 + v**2).mean(dim="longitude")

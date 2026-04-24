@@ -5,7 +5,7 @@ import pytest
 np = pytest.importorskip("numpy")
 xr = pytest.importorskip("xarray")
 
-from mars_exact_lec.common.integrals import build_mass_integrator
+from mars_exact_lec.common.integrals import build_mass_integrator, pressure_level_edges
 from mars_exact_lec.common.topography_measure import TopographyAwareMeasure
 from mars_exact_lec.constants_mars import MARS
 from mars_exact_lec.io.mask_below_ground import make_theta
@@ -15,6 +15,7 @@ from mars_exact_lec.reference_state import (
     koehler_isentropic_layer_mass_statistics,
     resolve_surface_potential_temperature,
 )
+from mars_exact_lec.reference_state.koehler1986_preprocessing import _prepare_koehler1986_observed_state
 
 from .helpers import make_coords, pressure_field, surface_pressure, temperature_from_theta_values
 
@@ -56,6 +57,41 @@ def _build_stable_case(
     theta_mask = make_theta(pressure, ps)
     integrator = build_mass_integrator(level, latitude, longitude)
     return {
+        "pressure": pressure,
+        "ps": ps,
+        "pt": pt,
+        "surface_theta": surface_theta,
+        "theta_mask": theta_mask,
+        "integrator": integrator,
+    }
+
+
+def _build_non_midpoint_level_bounds_case():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[820.0, 560.0, 240.0])
+    level_bounds = xr.DataArray(
+        np.asarray([[980.0, 700.0], [700.0, 420.0], [420.0, 60.0]]),
+        dims=("level", "bounds"),
+        coords={"level": level.values, "bounds": [0, 1]},
+        name="level_bounds",
+        attrs={"units": "Pa"},
+    )
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps = surface_pressure(time, latitude, longitude, 650.0)
+    pt = temperature_from_theta_values(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.asarray([180.0, 200.0, 220.0])[None, :, None, None],
+    )
+    pt = pt * (MARS.p00 / pressure) ** MARS.kappa
+    pt.name = "potential_temperature"
+    surface_theta = _surface_theta_field(ps, 170.0)
+    theta_mask = make_theta(pressure, ps)
+    integrator = build_mass_integrator(level, latitude, longitude, level_bounds=level_bounds)
+    return {
+        "level": level,
+        "level_bounds": level_bounds,
         "pressure": pressure,
         "ps": ps,
         "pt": pt,
@@ -224,6 +260,15 @@ def test_interpolate_pressure_to_koehler_isentropes_reports_monotonic_repair_and
     case = _build_stable_case(theta_profile=[190.0, 185.0, 230.0], surface_theta_value=170.0, ps_value=750.0)
     targets = [160.0, 180.0, 200.0, 220.0]
 
+    default = interpolate_pressure_to_koehler_isentropes(
+        case["pt"],
+        case["pressure"],
+        case["ps"],
+        case["surface_theta"],
+        targets,
+        theta_mask=case["theta_mask"],
+        interpolation_space="pressure",
+    )
     repaired = interpolate_pressure_to_koehler_isentropes(
         case["pt"],
         case["pressure"],
@@ -245,14 +290,63 @@ def test_interpolate_pressure_to_koehler_isentropes_reports_monotonic_repair_and
         interpolation_space="pressure",
     )
 
-    assert int(repaired["monotonic_violations"].isel(time=0, latitude=0, longitude=0)) == 1
-    assert int(repaired["monotonic_repairs"].isel(time=0, latitude=0, longitude=0)) >= 1
-    assert bool(repaired["column_interpolation_valid"].isel(time=0, latitude=0, longitude=0))
+    assert default.attrs["monotonic_policy"] == "reject"
+    assert int(default["monotonic_violations"].isel(time=0, latitude=0, longitude=0)) == 1
+    assert int(default["monotonic_repairs"].isel(time=0, latitude=0, longitude=0)) == 0
+    assert not bool(default["column_interpolation_valid"].isel(time=0, latitude=0, longitude=0))
+    assert np.isnan(_column_sample(default["pressure_on_theta"]).values).all()
 
+    assert repaired.attrs["monotonic_policy"] == "repair"
+    assert int(repaired["monotonic_violations"].isel(time=0, latitude=0, longitude=0)) == 1
+    assert int(repaired["monotonic_repairs"].isel(time=0, latitude=0, longitude=0)) == 1
+    assert bool(repaired["column_interpolation_valid"].isel(time=0, latitude=0, longitude=0))
+    np.testing.assert_allclose(
+        _column_sample(repaired["pressure_on_theta"]).values,
+        np.asarray([750.0, 625.0, 450.0, 350.0]),
+    )
+
+    assert rejected.attrs["monotonic_policy"] == "reject"
     assert int(rejected["monotonic_violations"].isel(time=0, latitude=0, longitude=0)) == 1
     assert int(rejected["monotonic_repairs"].isel(time=0, latitude=0, longitude=0)) == 0
     assert not bool(rejected["column_interpolation_valid"].isel(time=0, latitude=0, longitude=0))
     assert np.isnan(_column_sample(rejected["pressure_on_theta"]).values).all()
+
+
+def test_interpolate_pressure_to_koehler_isentropes_uses_explicit_level_bounds_for_column_edges():
+    case = _build_non_midpoint_level_bounds_case()
+
+    interpolation = interpolate_pressure_to_koehler_isentropes(
+        case["pt"],
+        case["pressure"],
+        case["ps"],
+        case["surface_theta"],
+        [160.0, 180.0, 200.0, 220.0, 240.0],
+        theta_mask=case["theta_mask"],
+        level_bounds=case["level_bounds"],
+        interpolation_space="pressure",
+    )
+
+    explicit_edges = pressure_level_edges(case["level"], bounds=case["level_bounds"])
+    midpoint_edges = pressure_level_edges(case["level"])
+    measure = TopographyAwareMeasure.from_surface_pressure(
+        case["level"],
+        case["ps"],
+        case["integrator"],
+        level_bounds=case["level_bounds"],
+    )
+
+    assert not np.allclose(explicit_edges.values, midpoint_edges.values)
+    np.testing.assert_allclose(explicit_edges.values, np.asarray([980.0, 700.0, 420.0, 60.0]))
+    np.testing.assert_allclose(case["integrator"].level_edges.values, explicit_edges.values)
+    np.testing.assert_allclose(measure.level_edges.values, explicit_edges.values)
+    np.testing.assert_allclose(
+        interpolation["column_top_edge_pressure"].isel(time=0).values,
+        60.0,
+    )
+    np.testing.assert_allclose(
+        interpolation["column_bottom_edge_pressure"].isel(time=0).values,
+        700.0,
+    )
 
 
 def test_koehler_isentropic_layer_mass_statistics_close_layers_with_surface_and_top_edge():
@@ -304,3 +398,40 @@ def test_koehler_isentropic_layer_mass_statistics_close_layers_with_surface_and_
     np.testing.assert_allclose(stats.coords["upper_theta"].values, np.asarray([180.0, 200.0, 220.0, 240.0]))
     assert stats.attrs["mass_mode"] == "koehler1986_observed_state"
     assert stats.attrs["surface_pressure_behavior"] == "surface_aware"
+
+
+def test_prepare_koehler1986_observed_state_keeps_level_bounds_consistent_through_mass_statistics():
+    case = _build_non_midpoint_level_bounds_case()
+
+    observed = _prepare_koehler1986_observed_state(
+        case["pt"],
+        case["pressure"],
+        case["ps"],
+        surface_potential_temperature=case["surface_theta"],
+        theta_levels=[160.0, 180.0, 200.0, 220.0, 240.0],
+        level_bounds=case["level_bounds"],
+        interpolation_space="pressure",
+    )
+
+    np.testing.assert_allclose(
+        observed["column_top_edge_pressure"].isel(time=0).values,
+        60.0,
+    )
+    np.testing.assert_allclose(
+        observed["column_bottom_edge_pressure"].isel(time=0).values,
+        700.0,
+    )
+    np.testing.assert_allclose(
+        _column_sample(observed["interface_pressure"]).values,
+        np.asarray([650.0, 620.0, 560.0, 240.0, 60.0]),
+    )
+    np.testing.assert_allclose(
+        _column_sample(observed["layer_pressure_thickness"]).values,
+        np.asarray([30.0, 60.0, 320.0, 180.0]),
+    )
+
+    expected_total_mass = float(case["integrator"].cell_area.sum()) * (650.0 - 60.0) / MARS.g
+    np.testing.assert_allclose(
+        observed["layer_mass"].sum(dim=ISENTROPIC_LAYER_DIM).values,
+        expected_total_mass,
+    )

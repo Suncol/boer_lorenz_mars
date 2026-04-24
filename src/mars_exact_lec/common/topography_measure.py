@@ -4,13 +4,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import cached_property
+import warnings
 
 import numpy as np
 import xarray as xr
 
-from .._validation import normalize_field, normalize_surface_field, normalize_zonal_field, require_dataarray
+from .._validation import (
+    normalize_field,
+    normalize_surface_field,
+    normalize_theta_mask,
+    normalize_zonal_field,
+    require_dataarray,
+    resolve_deprecated_theta_mask,
+)
 from ..constants_mars import MARS, MarsConstants
 from .integrals import MassIntegrator, pressure_level_edges
+
+
+_CLIPPED_DOMAIN_WARNING = (
+    "surface_pressure_policy='clip' truncated at least one column to the deepest model "
+    "pressure interface. The resulting exact diagnostics are exact only on the "
+    "model-resolved truncated pressure domain, not on the full atmosphere."
+)
 
 
 def _coordinate_matches(reference: xr.DataArray, current: xr.DataArray, coord_name: str) -> bool:
@@ -105,13 +120,14 @@ def _expected_effective_surface_pressure(
     level_bounds: xr.DataArray | None = None,
     pressure_tolerance: float = 1.0e-6,
     surface_pressure_policy: str = "raise",
+    warn_on_clip: bool = False,
 ) -> xr.DataArray:
     level_edges = pressure_level_edges(integrator.delta_p.coords["level"], bounds=level_bounds)
     deepest_level_edge = float(level_edges.isel(level_edge=0))
     normalized_policy = _validate_surface_pressure_policy(surface_pressure_policy)
+    too_deep = np.asarray(surface_pressure.values, dtype=float) > deepest_level_edge + float(pressure_tolerance)
 
     if normalized_policy == "raise":
-        too_deep = np.asarray(surface_pressure.values, dtype=float) > deepest_level_edge + float(pressure_tolerance)
         if np.any(too_deep):
             raise ValueError(
                 "Surface pressure extends below the deepest model pressure interface; "
@@ -119,6 +135,8 @@ def _expected_effective_surface_pressure(
             )
         effective_surface_pressure = surface_pressure
     else:
+        if warn_on_clip and np.any(too_deep):
+            warnings.warn(_CLIPPED_DOMAIN_WARNING, UserWarning, stacklevel=3)
         effective_surface_pressure = xr.apply_ufunc(
             np.minimum,
             surface_pressure,
@@ -141,7 +159,7 @@ def _validate_measure_compatibility(
     measure: "TopographyAwareMeasure",
     integrator: MassIntegrator,
     *,
-    theta: xr.DataArray | None = None,
+    theta_mask: xr.DataArray | None = None,
     surface_pressure: xr.DataArray | None = None,
 ) -> None:
     if not _coordinate_matches(integrator.delta_p, measure.integrator.delta_p, "level"):
@@ -157,11 +175,13 @@ def _validate_measure_compatibility(
         ):
             raise ValueError("Explicit 'measure' does not use the same level bounds as the integrator.")
 
-    if theta is not None:
-        theta = normalize_field(theta, "theta")
+    if theta_mask is not None:
+        theta_mask = normalize_theta_mask(theta_mask)
         for coord_name in ("time", "level", "latitude", "longitude"):
-            if not _coordinate_matches(measure.cell_fraction, theta, coord_name):
-                raise ValueError(f"Explicit 'measure' does not match the {coord_name!r} coordinate of 'theta'.")
+            if not _coordinate_matches(measure.cell_fraction, theta_mask, coord_name):
+                raise ValueError(
+                    f"Explicit 'measure' does not match the {coord_name!r} coordinate of 'theta_mask'."
+                )
 
     if surface_pressure is not None:
         surface_pressure = _coerce_surface_pressure(surface_pressure, integrator)
@@ -245,6 +265,7 @@ class TopographyAwareMeasure:
             level_bounds=level_bounds,
             pressure_tolerance=float(self.pressure_tolerance),
             surface_pressure_policy=normalized_policy,
+            warn_on_clip=True,
         )
         matches_effective_surface_pressure, max_abs_difference = _surface_pressure_values_match(
             effective_surface_pressure,
@@ -351,7 +372,7 @@ class TopographyAwareMeasure:
         )
 
     @cached_property
-    def above_ground_dp(self) -> xr.DataArray:
+    def effective_bottom_pressure(self) -> xr.DataArray:
         ps_4d = self.effective_surface_pressure.expand_dims(level=self.integrator.delta_p.coords["level"]).transpose(
             "time",
             "level",
@@ -360,8 +381,21 @@ class TopographyAwareMeasure:
         )
         lower_4d = self.lower_edge.broadcast_like(ps_4d)
         upper_4d = self.upper_edge.broadcast_like(ps_4d)
-        clipped_bottom = xr.apply_ufunc(np.minimum, ps_4d, lower_4d)
-        above_ground_dp = xr.where(ps_4d > upper_4d, clipped_bottom - upper_4d, 0.0)
+        bottom = xr.apply_ufunc(np.minimum, ps_4d, lower_4d)
+        bottom = xr.apply_ufunc(np.maximum, bottom, upper_4d).astype(float)
+        bottom.name = "effective_bottom_pressure"
+        bottom.attrs.update(
+            {
+                "units": "Pa",
+                "long_name": "effective bottom pressure of the above-ground portion of each pressure layer",
+            }
+        )
+        return self.annotate_domain_metadata(bottom)
+
+    @cached_property
+    def above_ground_dp(self) -> xr.DataArray:
+        upper_4d = self.upper_edge.broadcast_like(self.effective_bottom_pressure)
+        above_ground_dp = self.effective_bottom_pressure - upper_4d
         above_ground_dp = above_ground_dp.clip(min=0.0).astype(float)
         above_ground_dp.name = "above_ground_dp"
         above_ground_dp.attrs.update(
@@ -438,6 +472,7 @@ def resolve_exact_measure(
     *,
     measure: TopographyAwareMeasure | None = None,
     ps: xr.DataArray | None = None,
+    theta_mask: xr.DataArray | None = None,
     theta: xr.DataArray | None = None,
     surface_pressure_policy: str = "raise",
     pressure_tolerance: float = 1.0e-6,
@@ -450,11 +485,13 @@ def resolve_exact_measure(
     raw surface-pressure field.
     """
 
+    theta_mask = resolve_deprecated_theta_mask(theta_mask, theta, required=False)
+
     if measure is not None:
         _validate_measure_compatibility(
             measure,
             integrator,
-            theta=theta,
+            theta_mask=theta_mask,
             surface_pressure=ps,
         )
         return measure
@@ -465,7 +502,7 @@ def resolve_exact_measure(
             "provide 'ps' or an explicit 'measure'."
         )
 
-    level = theta.coords["level"] if theta is not None else integrator.delta_p.coords["level"]
+    level = theta_mask.coords["level"] if theta_mask is not None else integrator.delta_p.coords["level"]
     return TopographyAwareMeasure.from_surface_pressure(
         level,
         ps,

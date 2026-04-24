@@ -237,7 +237,6 @@ def build_mass_integrator(
 
     level = normalize_coordinate(level, "level")
     latitude = normalize_coordinate(latitude, "latitude")
-    longitude = normalize_coordinate(longitude, "longitude")
     resolved_level_bounds = _get_explicit_level_bounds(level, bounds=level_bounds)
     return MassIntegrator(
         delta_p=delta_p(level, bounds=resolved_level_bounds),

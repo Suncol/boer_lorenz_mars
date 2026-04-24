@@ -90,11 +90,44 @@ class ReferenceStateSolution:
     converged: xr.DataArray | None = None
     iterations_zonal: xr.DataArray | None = None
     converged_zonal: xr.DataArray | None = None
+    monotonic_violations: xr.DataArray | None = None
+    monotonic_repairs: xr.DataArray | None = None
+    monotonic_violations_zonal: xr.DataArray | None = None
+    monotonic_repairs_zonal: xr.DataArray | None = None
     method: str | None = None
     constants: MarsConstants = MARS
     _theta_reference_zonal: xr.DataArray | None = field(default=None, repr=False)
     _pi_reference_zonal: xr.DataArray | None = field(default=None, repr=False)
     _reference_bottom_pressure_zonal: xr.DataArray | None = field(default=None, repr=False)
+
+    @staticmethod
+    def _convergence_truth_values(status: xr.DataArray) -> np.ndarray:
+        values = np.asarray(status.values)
+        with np.errstate(invalid="ignore"):
+            truth = np.equal(values, True)
+        return np.asarray(truth, dtype=bool)
+
+    def _ensure_converged(self, *, zonal: bool, api_name: str) -> None:
+        field_name = "converged_zonal" if zonal else "converged"
+        status = getattr(self, field_name)
+        if status is None:
+            raise ValueError(
+                f"ReferenceStateSolution.{api_name}() cannot verify reference-state convergence "
+                f"because {field_name!r} is None."
+            )
+
+        truth = self._convergence_truth_values(status)
+        if truth.size == 0:
+            raise ValueError(
+                f"ReferenceStateSolution.{api_name}() cannot verify reference-state convergence "
+                f"because {field_name!r} is empty."
+            )
+        if not bool(np.all(truth)):
+            failed = int(truth.size - np.count_nonzero(truth))
+            raise ValueError(
+                f"ReferenceStateSolution.{api_name}() cannot evaluate a non-converged reference state; "
+                f"{field_name!r} contains {failed} false or missing value(s)."
+            )
 
     def _evaluate_curve(
         self,
@@ -167,6 +200,7 @@ class ReferenceStateSolution:
     ) -> xr.DataArray:
         """Evaluate the full reference pressure curve."""
 
+        self._ensure_converged(zonal=False, api_name="reference_pressure")
         potential_temperature = _normalize_reference_target(
             potential_temperature,
             "potential_temperature",
@@ -188,6 +222,7 @@ class ReferenceStateSolution:
     ) -> xr.DataArray:
         """Evaluate the zonal reference pressure curve on a zonal field."""
 
+        self._ensure_converged(zonal=True, api_name="zonal_reference_pressure")
         representative_theta = normalize_zonal_field(
             representative_theta,
             "representative_theta",

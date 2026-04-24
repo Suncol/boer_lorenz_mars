@@ -1131,15 +1131,23 @@ def test_reference_state_fast_stress_sentinel_remains_converged_finite_and_close
         assert np.all(np.diff(profile["reference_interface_geopotential"]) > 0.0)
 
 
-def test_reference_state_default_phis_none_matches_zero_topography():
+def test_reference_state_requires_phis_unless_flat_surface_is_explicit():
     case = _build_flat_reference_case(ntime=1)
     pressure = case["pressure"]
     ps = case["ps"]
+    phis = case["phis"]
     pt = case["pt"]
     level = case["level"]
+    solver = _solver_for_case(ps, level)
 
-    implicit = _solver_for_case(ps, level).solve(pt, pressure, ps)
+    with pytest.raises(ValueError, match="requires 'phis'"):
+        solver.solve(pt, pressure, ps)
+
+    implicit = solver.solve(pt, pressure, ps, assume_flat_surface=True)
     explicit = case["solution"]
+
+    with pytest.raises(ValueError, match="either 'phis' or assume_flat_surface"):
+        _solver_for_case(ps, level).solve(pt, pressure, ps, phis=phis, assume_flat_surface=True)
 
     np.testing.assert_allclose(implicit.theta_reference.values, explicit.theta_reference.values, atol=1.0e-12)
     np.testing.assert_allclose(implicit.pi_reference.values, explicit.pi_reference.values, atol=1.0e-12)

@@ -27,6 +27,49 @@ from .helpers import (
 )
 
 
+def _conversion_theta_mask_api_case():
+    time, level, latitude, longitude = make_coords(ntime=1, level_values=[800.0, 400.0], nlat=2, nlon=4)
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps = surface_pressure(
+        time,
+        latitude,
+        longitude,
+        np.asarray(
+            [
+                [700.0, 650.0, 500.0, 250.0],
+                [700.0, 650.0, 500.0, 250.0],
+            ]
+        ),
+    )
+    theta_mask = make_theta(pressure, ps)
+    integrator = build_mass_integrator(level, latitude, longitude)
+    measure = TopographyAwareMeasure.from_surface_pressure(level, ps, integrator)
+    values_shape = (time.size, level.size, latitude.size, longitude.size)
+    omega = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(-0.5, 0.5, np.prod(values_shape)).reshape(values_shape),
+        name="omega",
+        units="Pa s-1",
+    )
+    alpha = full_field(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.linspace(0.5, 1.5, np.prod(values_shape)).reshape(values_shape),
+        name="alpha",
+        units="m3 kg-1",
+    )
+    return omega, alpha, theta_mask, integrator, ps, measure
+
+
+def _mask_filled_like(theta_mask, value):
+    return theta_mask.copy(data=np.full(theta_mask.shape, value, dtype=float))
+
+
 def test_eddy_free_fields_give_zero_ke_and_ce():
     time, level, latitude, longitude = make_coords()
     pressure = pressure_field(time, level, latitude, longitude)
@@ -175,6 +218,59 @@ def test_conversion_auto_measure_matches_explicit_measure():
     explicit = conversion_eddy_ape_to_ke(omega, alpha, theta, integrator, measure=measure)
 
     np.testing.assert_allclose(auto.values, explicit.values)
+
+
+def test_conversion_theta_mask_api_accepts_positional_keyword_and_deprecated_theta():
+    omega, alpha, theta_mask, integrator, ps, _ = _conversion_theta_mask_api_case()
+
+    positional = conversion_eddy_ape_to_ke(omega, alpha, theta_mask, integrator, ps=ps)
+    keyword = conversion_eddy_ape_to_ke(
+        omega,
+        alpha,
+        theta_mask=theta_mask,
+        integrator=integrator,
+        ps=ps,
+    )
+    with pytest.warns(FutureWarning, match="'theta' is deprecated"):
+        deprecated = conversion_eddy_ape_to_ke(omega, alpha, theta=theta_mask, integrator=integrator, ps=ps)
+
+    np.testing.assert_allclose(keyword.values, positional.values)
+    np.testing.assert_allclose(deprecated.values, positional.values)
+    with pytest.warns(FutureWarning, match="'theta' is deprecated"):
+        with pytest.raises(ValueError, match="only one of 'theta_mask' or deprecated 'theta'"):
+            conversion_eddy_ape_to_ke(
+                omega,
+                alpha,
+                theta_mask=theta_mask,
+                theta=theta_mask,
+                integrator=integrator,
+                ps=ps,
+            )
+
+
+@pytest.mark.parametrize(
+    ("mask_value", "message"),
+    [
+        (180.0, r"\[0, 1\]"),
+        (np.nan, "finite mask values"),
+        (-0.1, r"\[0, 1\]"),
+        (1.1, r"\[0, 1\]"),
+    ],
+)
+def test_conversion_theta_mask_validation_rejects_invalid_values_even_with_measure(mask_value, message):
+    omega, alpha, theta_mask, integrator, ps, measure = _conversion_theta_mask_api_case()
+    bad_mask = _mask_filled_like(theta_mask, mask_value)
+
+    with pytest.raises(ValueError, match=message):
+        conversion_eddy_ape_to_ke(omega, alpha, theta_mask=bad_mask, integrator=integrator, ps=ps)
+    with pytest.raises(ValueError, match=message):
+        conversion_eddy_ape_to_ke(
+            omega,
+            alpha,
+            theta_mask=bad_mask,
+            integrator=integrator,
+            measure=measure,
+        )
 
 
 def test_conversion_body_terms_require_ps_or_explicit_measure():

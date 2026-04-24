@@ -177,6 +177,56 @@ def test_koehler1986_flat_reference_returns_public_solution_and_pressure_curve()
     )
 
 
+def test_koehler1986_reference_state_requires_phis_unless_flat_surface_is_explicit():
+    case = _build_flat_k86_case(phis_value=0.0)
+    solver = Koehler1986ReferenceState(
+        theta_levels=[180.0, 190.0, 210.0, 230.0, 250.0],
+        pressure_tolerance=1.0e-8,
+        max_iterations=64,
+        solver_strategy="koehler_iteration",
+    )
+    surface_theta = _surface_theta(case["ps"], 180.0)
+
+    with pytest.raises(ValueError, match="requires 'phis'"):
+        solver.solve(
+            case["potential_temperature"],
+            case["pressure"],
+            case["ps"],
+            surface_potential_temperature=surface_theta,
+        )
+
+    implicit = solver.solve(
+        case["potential_temperature"],
+        case["pressure"],
+        case["ps"],
+        assume_flat_surface=True,
+        surface_potential_temperature=surface_theta,
+    )
+    explicit = case["solution"]
+
+    with pytest.raises(ValueError, match="either 'phis' or assume_flat_surface"):
+        solver.solve(
+            case["potential_temperature"],
+            case["pressure"],
+            case["ps"],
+            phis=case["phis"],
+            assume_flat_surface=True,
+            surface_potential_temperature=surface_theta,
+        )
+
+    for name in (
+        "theta_reference",
+        "pi_reference",
+        "pi_s",
+        "pi_sZ",
+        "reference_surface_pressure",
+        "reference_bottom_pressure",
+        "reference_interface_pressure",
+        "reference_interface_geopotential",
+    ):
+        np.testing.assert_allclose(getattr(implicit, name).values, getattr(explicit, name).values, rtol=0.0, atol=1.0e-8)
+
+
 def test_koehler1986_iteration_conserves_observed_isentropic_layer_mass():
     case = _build_asymmetric_k86_case()
     solver = case["solver"]
@@ -306,6 +356,13 @@ def test_koehler1986_full_and_zonal_layer_mass_closure():
     ):
         pressure_residual = abs(family.mass_residual) * solver.constants.g / total_area
         assert float(pressure_residual.max()) <= 10.0 * solver.pressure_tolerance
+        mass_tolerance = 10.0 * solver.pressure_tolerance * total_area / solver.constants.g
+        np.testing.assert_allclose(
+            family.layer_mass_reference.values,
+            family.layer_mass_observed.values,
+            rtol=0.0,
+            atol=mass_tolerance,
+        )
         np.testing.assert_allclose(
             family.layer_mass_reference.sum(dim="isentropic_layer").values,
             case["solution"].total_mass.values,
@@ -322,6 +379,116 @@ def test_koehler1986_full_and_zonal_layer_mass_closure():
             rtol=1.0e-8,
             atol=1.0e-4,
         )
+
+
+def test_koehler1986_full_layer_mass_matches_hand_computed_nonuniform_bounds_case():
+    time, level, latitude, longitude = make_coords(
+        ntime=1,
+        level_values=[800.0, 500.0, 200.0],
+        nlat=2,
+        nlon=4,
+    )
+    level_bounds = xr.DataArray(
+        np.asarray(
+            [
+                [950.0, 650.0],
+                [650.0, 350.0],
+                [350.0, 50.0],
+            ],
+            dtype=float,
+        ),
+        dims=("level", "bounds"),
+        coords={"level": level.values, "bounds": [0, 1]},
+        name="level_bounds",
+        attrs={"units": "Pa"},
+    )
+    pressure = pressure_field(time, level, latitude, longitude)
+    ps_values = np.asarray(
+        [
+            [930.0, 890.0, 850.0, 810.0],
+            [920.0, 880.0, 840.0, 820.0],
+        ],
+        dtype=float,
+    )
+    ps = surface_pressure(time, latitude, longitude, ps_values)
+    phis = surface_geopotential(time, latitude, longitude, 0.0)
+    temperature = temperature_from_theta_values(
+        time,
+        level,
+        latitude,
+        longitude,
+        np.asarray([180.0, 200.0, 225.0], dtype=float)[None, :, None, None],
+    )
+    pt = potential_temperature(temperature, pressure)
+    surface_theta = _surface_theta(ps, 170.0)
+    integrator = build_mass_integrator(level, latitude, longitude, level_bounds=level_bounds)
+    solver = Koehler1986ReferenceState(
+        theta_levels=[160.0, 180.0, 200.0, 220.0, 240.0],
+        interpolation_space="pressure",
+        pressure_tolerance=1.0e-6,
+        max_iterations=100,
+    )
+
+    solution = solver.solve(
+        pt,
+        pressure,
+        ps,
+        phis=phis,
+        surface_potential_temperature=surface_theta,
+        level_bounds=level_bounds,
+    )
+    state = solver._last_geometry_state
+    observed = solver._last_observed_state
+    assert state is not None
+    assert observed is not None
+    assert bool(solution.converged.values.all())
+
+    expected_interfaces = np.empty((time.size, 5, latitude.size, longitude.size), dtype=float)
+    expected_interfaces[:, 0, :, :] = ps_values
+    expected_interfaces[:, 1, :, :] = 800.0
+    expected_interfaces[:, 2, :, :] = 500.0
+    expected_interfaces[:, 3, :, :] = 260.0
+    expected_interfaces[:, 4, :, :] = 50.0
+    expected_thickness = expected_interfaces[:, :-1, :, :] - expected_interfaces[:, 1:, :, :]
+    expected_mass = (
+        expected_thickness
+        * np.asarray(integrator.cell_area.values, dtype=float)[None, None, :, :]
+        / solver.constants.g
+    ).sum(axis=(2, 3))
+
+    np.testing.assert_allclose(
+        observed["interface_pressure"].values,
+        expected_interfaces,
+        rtol=0.0,
+        atol=1.0e-10,
+    )
+    np.testing.assert_allclose(
+        observed["layer_pressure_thickness"].values,
+        expected_thickness,
+        rtol=0.0,
+        atol=1.0e-10,
+    )
+    np.testing.assert_allclose(
+        observed["layer_mass"].values,
+        expected_mass,
+        rtol=1.0e-12,
+        atol=1.0e-3,
+    )
+
+    total_area = float(integrator.cell_area.sum())
+    mass_tolerance = 20.0 * solver.pressure_tolerance * total_area / solver.constants.g
+    np.testing.assert_allclose(
+        state.full_family.layer_mass_observed.values,
+        expected_mass,
+        rtol=1.0e-12,
+        atol=1.0e-3,
+    )
+    np.testing.assert_allclose(
+        state.full_family.layer_mass_reference.values,
+        expected_mass,
+        rtol=0.0,
+        atol=mass_tolerance,
+    )
 
 
 def test_koehler1986_flat_limit_is_insensitive_to_zero_vs_constant_phis():

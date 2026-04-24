@@ -1,4 +1,9 @@
-"""Validation helpers for comparing Mars exact diagnostics against SEBA HKE."""
+"""Validation helpers for live SEBA spectral component cross-checks.
+
+These helpers expose SEBA spectral energy components on pressure levels for
+cross-validation. They intentionally do not claim that SEBA APE/VKE/RKE/DKE are
+the same mathematical objects as Boer exact four-reservoir diagnostics.
+"""
 
 from __future__ import annotations
 
@@ -118,7 +123,7 @@ def _resolve_live_seba_energy_budget():
             sys.modules.update(removed_modules)
 
 
-def seba_total_hke_per_level(
+def seba_energy_components_per_level(
     dataset: xr.Dataset,
     *,
     p_levels,
@@ -126,12 +131,12 @@ def seba_total_hke_per_level(
     variables: dict[str, str] | None = None,
     truncation: int | None = None,
     rsphere: float = MARS.a,
-) -> xr.DataArray:
-    """Return SEBA total horizontal KE per level by summing the degree spectrum.
+) -> xr.Dataset:
+    """Return SEBA RKE/DKE/HKE/VKE/APE per level by summing degree spectra.
 
-    This helper is intentionally limited to HKE validation. It does not expose
-    SEBA APE, SEBA pressure integrators, or any rotational/divergent component
-    comparisons against Boer's zonal/eddy split.
+    These are SEBA spectral components for validation and regression checks.
+    They are not Boer exact reservoir terms and should not be interpreted as a
+    replacement for the exact topographic Lorenz/Boer cycle.
     """
 
     EnergyBudget = _resolve_live_seba_energy_budget()
@@ -144,11 +149,50 @@ def seba_total_hke_per_level(
         truncation=truncation,
         rsphere=rsphere,
     )
-    _, _, hke = budget.horizontal_kinetic_energy()
-    total = hke.sum(dim="kappa")
+    rke, dke, hke = budget.horizontal_kinetic_energy()
+    components = {
+        "rke": rke,
+        "dke": dke,
+        "hke": hke,
+        "vke": budget.vertical_kinetic_energy(),
+        "ape": budget.available_potential_energy(),
+    }
+    data_vars = {}
+    for component_name, spectrum in components.items():
+        per_level = spectrum.sum(dim="kappa")
+        per_level.name = f"seba_{component_name}_per_level"
+        per_level.attrs["units"] = spectrum.attrs.get("units", "m**2 s**-2")
+        per_level.attrs["validation_role"] = "live_seba_spectral_component"
+        per_level.attrs["component"] = component_name
+        data_vars[per_level.name] = per_level
+    result = xr.Dataset(data_vars=data_vars)
+    result.attrs["validation_role"] = "live_seba_spectral_components_per_level"
+    result.attrs["boer_exact_equivalence"] = "none"
+    return result
+
+
+def seba_total_hke_per_level(
+    dataset: xr.Dataset,
+    *,
+    p_levels,
+    ps: xr.DataArray,
+    variables: dict[str, str] | None = None,
+    truncation: int | None = None,
+    rsphere: float = MARS.a,
+) -> xr.DataArray:
+    """Return SEBA total horizontal KE per level by summing the degree spectrum."""
+
+    components = seba_energy_components_per_level(
+        dataset,
+        p_levels=p_levels,
+        ps=ps,
+        variables=variables,
+        truncation=truncation,
+        rsphere=rsphere,
+    )
+    total = components["seba_hke_per_level"].copy(deep=False)
     total.name = "seba_total_hke_per_level"
-    total.attrs["units"] = hke.attrs.get("units", "m**2 s**-2")
     return total
 
 
-__all__ = ["seba_total_hke_per_level"]
+__all__ = ["seba_energy_components_per_level", "seba_total_hke_per_level"]

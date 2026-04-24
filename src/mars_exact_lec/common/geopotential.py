@@ -2,18 +2,68 @@
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import xarray as xr
 
 from .._validation import (
     SURFACE_DIMS,
     ensure_matching_coordinates,
+    normalize_bool_mask,
     normalize_field,
     normalize_surface_field,
     require_dataarray,
+    resolve_deprecated_theta_mask,
 )
 from ..constants_mars import MARS, MarsConstants
 from ..io.mask_below_ground import make_theta
+
+
+GEOPOTENTIAL_MODES = ("strict", "hydrostatic", "fill")
+
+
+def normalize_geopotential_mode(geopotential_mode: str) -> str:
+    """Return a normalized explicit geopotential provenance mode."""
+
+    normalized = str(geopotential_mode).strip().lower()
+    if normalized not in GEOPOTENTIAL_MODES:
+        raise ValueError(
+            "'geopotential_mode' must be one of 'strict', 'hydrostatic', or 'fill'."
+        )
+    return normalized
+
+
+def resolve_deprecated_geopotential_mode(
+    geopotential_mode: str,
+    deprecated_value: bool | None,
+    *,
+    deprecated_name: str,
+) -> str:
+    """Resolve explicit geopotential mode and a transition-window boolean spelling."""
+
+    mode = normalize_geopotential_mode(geopotential_mode)
+    if deprecated_value is None:
+        return mode
+
+    warnings.warn(
+        f"'{deprecated_name}' is deprecated; use "
+        "geopotential_mode='strict', 'hydrostatic', or 'fill' instead.",
+        FutureWarning,
+        stacklevel=3,
+    )
+    if mode != "strict":
+        raise ValueError(
+            f"Pass only one of 'geopotential_mode' or deprecated '{deprecated_name}'."
+        )
+    return "hydrostatic" if bool(deprecated_value) else "strict"
+
+
+def _with_geopotential_mode_attr(field: xr.DataArray, mode: str) -> xr.DataArray:
+    result = field.copy(deep=False)
+    result.attrs = dict(field.attrs)
+    result.attrs["geopotential_mode"] = mode
+    return result
 
 
 def broadcast_surface_field(
@@ -133,6 +183,7 @@ def reconstruct_hydrostatic_geopotential(
     phis: xr.DataArray,
     *,
     ps: xr.DataArray,
+    theta_mask: xr.DataArray | None = None,
     theta: xr.DataArray | None = None,
     constants: MarsConstants = MARS,
 ) -> xr.DataArray:
@@ -142,11 +193,11 @@ def reconstruct_hydrostatic_geopotential(
     pressure = normalize_field(pressure, "pressure")
     ensure_matching_coordinates(temperature, [pressure])
 
-    if theta is None:
-        theta = make_theta(pressure, ps)
+    if theta_mask is None and theta is None:
+        theta_mask = make_theta(pressure, ps)
     else:
-        theta = normalize_field(theta, "theta")
-        ensure_matching_coordinates(temperature, [theta])
+        theta_mask = resolve_deprecated_theta_mask(theta_mask, theta)
+        ensure_matching_coordinates(temperature, [theta_mask])
 
     surface_pressure = broadcast_surface_field(ps, temperature, "ps")
     surface_geopotential = broadcast_surface_field(phis, temperature, "phis")
@@ -155,7 +206,7 @@ def reconstruct_hydrostatic_geopotential(
         _reconstruct_column_geopotential,
         temperature,
         pressure,
-        theta,
+        theta_mask,
         surface_pressure,
         surface_geopotential,
         kwargs={"gas_constant": constants.Rd},
@@ -179,14 +230,30 @@ def resolve_geopotential(
     pressure: xr.DataArray | None = None,
     phis: xr.DataArray | None = None,
     ps: xr.DataArray | None = None,
-    theta: xr.DataArray | None = None,
+    theta_mask: xr.DataArray | None = None,
     valid_mask: xr.DataArray | None = None,
+    theta: xr.DataArray | None = None,
+    geopotential_mode: str = "strict",
+    allow_reconstruction: bool | None = None,
     constants: MarsConstants = MARS,
 ) -> xr.DataArray:
-    """Return a canonical geopotential field, reconstructing it when needed."""
+    """Return a canonical geopotential field.
 
+    ``geopotential_mode='strict'`` requires explicit finite geopotential on the
+    requested domain. ``'hydrostatic'`` allows approximate hydrostatic
+    reconstruction or hydrostatic gap filling, with log-pressure filling as the
+    transition-window fallback for incomplete hydrostatic inputs. ``'fill'``
+    only allows log-pressure filling of an explicit level-center geopotential.
+    """
+
+    mode = resolve_deprecated_geopotential_mode(
+        geopotential_mode,
+        allow_reconstruction,
+        deprecated_name="allow_reconstruction",
+    )
+    theta_mask = resolve_deprecated_theta_mask(theta_mask, theta, required=False)
     if valid_mask is not None:
-        valid_mask = normalize_field(valid_mask, "valid_mask").astype(bool)
+        valid_mask = normalize_bool_mask(valid_mask, "valid_mask")
 
     if geopotential is not None:
         geopotential = normalize_field(geopotential, "geopotential")
@@ -195,8 +262,8 @@ def resolve_geopotential(
         if pressure is not None:
             pressure = normalize_field(pressure, "pressure")
             ensure_matching_coordinates(pressure, [geopotential])
-        if theta is not None:
-            ensure_matching_coordinates(normalize_field(theta, "theta"), [geopotential])
+        if theta_mask is not None:
+            ensure_matching_coordinates(theta_mask, [geopotential])
         if valid_mask is not None:
             ensure_matching_coordinates(geopotential, [valid_mask])
             geopotential = geopotential.where(valid_mask)
@@ -208,26 +275,44 @@ def resolve_geopotential(
             all_finite = np.all(np.isfinite(np.asarray(geopotential.values, dtype=float)[valid_values]))
 
         if all_finite:
-            return geopotential
+            return _with_geopotential_mode_attr(geopotential, mode)
 
-        if temperature is not None and pressure is not None and phis is not None and ps is not None:
+        if mode == "strict":
+            raise ValueError(
+                "Explicit geopotential contains non-finite values on the requested domain. "
+                "Provide a finite GCM geopotential, pass an interface geopotential where supported, "
+                "or set geopotential_mode='hydrostatic' or 'fill' to opt into approximate gap filling."
+            )
+
+        if (
+            mode == "hydrostatic"
+            and temperature is not None
+            and pressure is not None
+            and phis is not None
+            and ps is not None
+        ):
             reconstructed = reconstruct_hydrostatic_geopotential(
                 temperature=temperature,
                 pressure=pressure,
                 phis=phis,
                 ps=ps,
-                theta=theta if theta is not None else valid_mask,
+                theta_mask=theta_mask if theta_mask is not None else valid_mask,
                 constants=constants,
             )
             filled = geopotential.where(np.isfinite(geopotential), reconstructed)
+            filled.attrs = dict(geopotential.attrs)
+            filled.attrs["filled_hydrostatically"] = True
+            filled.attrs["geopotential_reconstruction_approximate"] = True
+            filled.attrs["geopotential_fill_method"] = "hydrostatic_reconstruction"
             if valid_mask is not None:
                 filled = filled.where(valid_mask)
-            return filled
+            return _with_geopotential_mode_attr(filled, mode)
 
         if pressure is None:
             raise ValueError(
                 "Explicit geopotential contains non-finite values; provide 'pressure' and either "
-                "('temperature', 'ps', 'phis') for hydrostatic continuation or a fully finite field."
+                "geopotential_mode='fill' for log-pressure filling or "
+                "('temperature', 'ps', 'phis') with geopotential_mode='hydrostatic' for hydrostatic continuation."
             )
 
         filled = xr.apply_ufunc(
@@ -243,28 +328,49 @@ def resolve_geopotential(
         filled.name = geopotential.name
         filled.attrs = dict(geopotential.attrs)
         filled.attrs["filled_below_ground"] = True
+        filled.attrs["geopotential_reconstruction_approximate"] = True
+        filled.attrs["geopotential_fill_method"] = "log_pressure_column_fill"
         if valid_mask is not None:
             filled = filled.where(valid_mask)
-        return filled
+        return _with_geopotential_mode_attr(filled, mode)
+
+    if mode == "strict":
+        raise ValueError(
+            "Resolving geopotential requires an explicit 'geopotential' field. "
+            "Hydrostatic reconstruction from 'temperature', 'pressure', 'ps', and 'phis' is approximate; "
+            "set geopotential_mode='hydrostatic' to opt in."
+        )
+
+    if mode == "fill":
+        raise ValueError(
+            "geopotential_mode='fill' requires an explicit 'geopotential' field with gaps to fill; "
+            "use geopotential_mode='hydrostatic' to reconstruct geopotential from temperature, pressure, ps, and phis."
+        )
 
     if temperature is None or pressure is None or phis is None or ps is None:
         raise ValueError(
             "Resolving geopotential requires either an explicit 'geopotential' field or "
-            "'temperature', 'pressure', 'ps', and 'phis'."
+            "'temperature', 'pressure', 'ps', and 'phis' with geopotential_mode='hydrostatic'."
         )
 
-    return reconstruct_hydrostatic_geopotential(
+    reconstructed = reconstruct_hydrostatic_geopotential(
         temperature=temperature,
         pressure=pressure,
         phis=phis,
         ps=ps,
-        theta=theta if theta is not None else valid_mask,
+        theta_mask=theta_mask if theta_mask is not None else valid_mask,
         constants=constants,
     )
+    reconstructed.attrs["geopotential_source"] = "hydrostatically_reconstructed"
+    reconstructed.attrs["geopotential_reconstruction_approximate"] = True
+    return _with_geopotential_mode_attr(reconstructed, mode)
 
 
 __all__ = [
+    "GEOPOTENTIAL_MODES",
     "broadcast_surface_field",
+    "normalize_geopotential_mode",
     "reconstruct_hydrostatic_geopotential",
+    "resolve_deprecated_geopotential_mode",
     "resolve_geopotential",
 ]
